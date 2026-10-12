@@ -107,16 +107,16 @@ const scenarios = [
     role: "system",
     compat: "pi-anthropic-compat",
     settings: anthropicCompatSettings,
-    jump: false,
+    compactOnly: false,
   },
-  // Usage passes both thresholds in one turn, so only the self-contained instruction is posted.
+  // Without prepareAt, only the self-contained compaction instruction is posted.
   {
     provider: "anthropic",
     model: "claude-fable-5-1",
     role: "system",
     compat: "pi-anthropic-compat",
     settings: anthropicCompatSettings,
-    jump: true,
+    compactOnly: true,
   },
   {
     provider: "openai-codex",
@@ -124,7 +124,7 @@ const scenarios = [
     role: "developer",
     compat: undefined,
     settings: undefined,
-    jump: false,
+    compactOnly: false,
   },
   {
     provider: "openai-codex",
@@ -132,12 +132,12 @@ const scenarios = [
     role: "developer",
     compat: "pi-openai-codex-compat",
     settings: undefined,
-    jump: false,
+    compactOnly: false,
   },
 ];
 for (const scenario of scenarios) {
   test(
-    `live packaged Pi CLI ${scenario.provider}/${scenario.model} ${scenario.compat ? `with ${scenario.compat}` : "without a compat extension"}${scenario.jump ? " past both thresholds at once" : ""} instructs, compacts, and resumes`,
+    `live packaged Pi CLI ${scenario.provider}/${scenario.model} ${scenario.compat ? `with ${scenario.compat}` : "without a compat extension"}${scenario.compactOnly ? " with only compactAt" : ""} instructs, compacts, and resumes`,
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 900_000 },
     async (t) => {
       const temporary = await mkdtemp(join(tmpdir(), "pi-compact-assistant-live-"));
@@ -254,17 +254,16 @@ for (const scenario of scenarios) {
         JSON.stringify({
           default: false,
           models: {
-            [`${scenario.provider}/${scenario.model}`]: {
-              prepareAt: baseline + 1500,
-              compactAt: baseline + 6000,
-            },
+            [`${scenario.provider}/${scenario.model}`]: scenario.compactOnly
+              ? { compactAt: baseline + 6000 }
+              : { prepareAt: baseline + 1500, compactAt: baseline + 6000 },
           },
         }),
       );
 
       client = new loaded.RpcClient(options);
       await client.start();
-      if (!scenario.jump) {
+      if (!scenario.compactOnly) {
         await turn("Use the read tool to read pad1.txt. Reply with the word on its last line.");
         assert.match(await lastAssistantText(), /amber/i);
       }
@@ -304,10 +303,10 @@ for (const scenario of scenarios) {
             ? entry.data.stage
             : undefined,
         ),
-        scenario.jump ? ["compact"] : ["prepare", "compact"],
+        scenario.compactOnly ? ["compact"] : ["prepare", "compact"],
       );
       const found = probes(entries);
-      for (const stage of scenario.jump ? ["compact"] : ["prepare", "compact"]) {
+      for (const stage of scenario.compactOnly ? ["compact"] : ["prepare", "compact"]) {
         const seen = found.filter((item) => item.stage === stage);
         assert.ok(seen.length > 0, `The ${stage} instruction reached the provider payload.`);
         for (const item of seen) {
@@ -354,7 +353,7 @@ for (const scenario of scenarios) {
 
       await turn("Reply with only the port number from the project facts.");
       assert.match(await lastAssistantText(), /4317/);
-      if (scenario.jump) {
+      if (scenario.compactOnly) {
         assert.ok(
           found.every((item) => item.stage !== "prepare"),
           "No preparation instruction reached the provider.",
@@ -371,7 +370,7 @@ for (const scenario of scenarios) {
         );
       }
       t.diagnostic(
-        `Pi ${piVersion} with ${scenario.compat ?? "no compat extension"}: ${scenario.jump ? "the self-contained compact instruction" : "prepare and compact instructions"} reached ${scenario.provider}/${scenario.model} as ${scenario.role} items; the model compacted and resumed.`,
+        `Pi ${piVersion} with ${scenario.compat ?? "no compat extension"}: ${scenario.compactOnly ? "the self-contained compact instruction" : "prepare and compact instructions"} reached ${scenario.provider}/${scenario.model} as ${scenario.role} items; the model compacted and resumed.`,
       );
     },
   );

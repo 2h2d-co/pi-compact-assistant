@@ -113,6 +113,35 @@ test("a single jump past both thresholds records one self-contained compaction i
   }
 });
 
+test("without prepareAt, only the self-contained compaction instruction is posted", async () => {
+  const { runtime, faux, errors } = await testRuntime({ default: { compactAt: 20000 } });
+  try {
+    const seen: Message[][] = [];
+    const record: FauxResponseFactory = (context) => {
+      seen.push(context.messages);
+      return fauxAssistantMessage("ok");
+    };
+    faux.setResponses([record, record, record]);
+    await runtime.session.prompt(`first request ${filler(3500)}`);
+    await runtime.session.prompt(`second request ${filler(20000)}`);
+    await runtime.session.prompt("third small request");
+
+    assert.deepEqual(laterSystemMessages(seen[0] ?? []), []);
+    const second = laterSystemMessages(seen[1] ?? []);
+    assert.equal(second.length, 1);
+    assert.match(second[0]?.text ?? "", /^\[Compaction required\]/);
+    assert.match(second[0]?.text ?? "", /Record the current state in a Markdown state file/);
+    assert.deepEqual(laterSystemMessages(seen[2] ?? []), second);
+    const records = runtime.session.sessionManager
+      .getEntries()
+      .filter((entry) => entry.type === "custom" && entry.customType === INSTRUCTION_TYPE);
+    assert.equal(records.length, 1);
+    assert.deepEqual(errors, []);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
 test("instructions are evaluated between tool calls within one run", async () => {
   const { runtime, faux, errors } = await testRuntime(SETTINGS, (pi) => {
     pi.registerTool({

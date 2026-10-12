@@ -3,20 +3,23 @@ export const COMPACT_TOOL_NAME = "compact";
 export type Stage = "prepare" | "compact";
 
 export interface StageThresholds {
-  prepareTokens: number;
+  /** Without a preparation threshold, only the compaction stage is reached. */
+  prepareTokens?: number;
   compactTokens: number;
 }
 
 /** The highest stage whose threshold the usage has reached. */
 export function reachedStage(tokens: number, thresholds: StageThresholds): Stage | undefined {
   if (tokens >= thresholds.compactTokens) return "compact";
-  if (tokens >= thresholds.prepareTokens) return "prepare";
+  if (thresholds.prepareTokens !== undefined && tokens >= thresholds.prepareTokens)
+    return "prepare";
   return undefined;
 }
 
 /**
  * `combined` replaces `compact` when the preparation instruction was not posted in this compaction
- * cycle, because usage passed both thresholds at once. It stands on its own.
+ * cycle, because usage passed both thresholds at once or no preparation threshold is set. It stands
+ * on its own.
  */
 export type InstructionKind = Stage | "combined";
 

@@ -23,4 +23,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   retrying. The extension compacts after the turn ends, then delivers the
   message and resumes the agent.
 - Read token or percentage thresholds from `~/.pi/agent/pi-compact-assistant.json`, with exact
-  `provider/modelId` entries and a default for other models.
+  `provider/modelId` entries and a default for other models. `prepareAt` is optional; without
+  it, only the self-contained compaction instruction is posted.

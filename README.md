@@ -44,6 +44,7 @@ Settings are read from `~/.pi/agent/pi-compact-assistant.json` when a session st
   "default": { "prepareAt": "70%", "compactAt": "80%" },
   "models": {
     "anthropic/claude-opus-5-5": { "prepareAt": 450000, "compactAt": 500000 },
+    "anthropic/claude-fable-5-1": { "compactAt": 500000 },
     "openai-codex/gpt-6.1-sol": { "prepareAt": "60%", "compactAt": "75%" },
     "openai-codex/gpt-5.3-codex-spark": false
   }
@@ -57,8 +58,9 @@ Settings are read from `~/.pi/agent/pi-compact-assistant.json` when a session st
 | `models`  | Thresholds or `false`, keyed by exact `provider/modelId`        | `{}`                                         |
 
 A threshold is a whole token count, such as `450000`, or a percentage of the model's context
-window, such as `"70%"`. A model entry needs both `prepareAt` and `compactAt`, and `compactAt`
-must resolve above `prepareAt`. Keys are exact and case-sensitive.
+window, such as `"70%"`. A model entry needs `compactAt`. `prepareAt` is optional and must
+resolve below `compactAt`. Without `prepareAt`, the model gets only the self-contained
+`[Compaction required]` instruction at `compactAt`. Keys are exact and case-sensitive.
 
 An invalid file disables the extension for the session. Interactive and RPC sessions show an error. Thresholds that are
 invalid for one model skip that model.
@@ -106,9 +108,9 @@ path and the exact next step. A model that cannot or may not write files skips t
 the full state in the message. After compaction, the continuation tells the model to read the
 named state file before acting.
 
-The extension records which instructions it posted in each compaction cycle. If usage passes
-both thresholds at once, so the preparation instruction was never posted, it posts a
-self-contained `[Compaction required]` instruction instead. That instruction asks the model to
+The extension records which instructions it posted in each compaction cycle. If the preparation
+instruction was never posted, because usage passed both thresholds at once or the model has no
+`prepareAt`, it posts a self-contained `[Compaction required]` instruction instead. That instruction asks the model to
 record the state in a Markdown state file under the same rules before calling `compact`.
 
 Pi sends later system messages in place only to models that accept them mid-conversation. Pi 1.1.0

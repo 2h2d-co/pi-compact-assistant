@@ -70,6 +70,7 @@ test("rejects invalid documents with the failing setting named", () => {
     [{ default: { prepareAt: "100%", compactAt: "90%" } }, /default\.prepareAt must be/],
     [{ default: { prepareAt: "70", compactAt: "90%" } }, /default\.prepareAt must be/],
     [{ default: { prepareAt: 10 } }, /default\.compactAt must be/],
+    [{ default: { prepareAt: null, compactAt: 10 } }, /default\.prepareAt must be/],
     [{ default: { prepareAt: 10, compactAt: 20, keep: 1 } }, /default\.keep is not a setting/],
     [{ default: true }, /default must be an object/],
     [{ models: [] }, /models must be an object/],
@@ -107,6 +108,21 @@ test("selects the highest reached stage", () => {
   assert.equal(reachedStage(449_999, thresholds), undefined);
   assert.equal(reachedStage(450_000, thresholds), "prepare");
   assert.equal(reachedStage(500_000, thresholds), "compact");
+  // Without a preparation threshold, only the compaction stage exists.
+  assert.equal(reachedStage(499_999, { compactTokens: 500_000 }), undefined);
+  assert.equal(reachedStage(500_000, { compactTokens: 500_000 }), "compact");
+});
+
+test("prepareAt is optional", () => {
+  const settings = parseSettings({
+    default: { compactAt: "80%" },
+    models: { "anthropic/claude-opus-5-5": { compactAt: 500_000 } },
+  });
+  assert.deepEqual(settings.models["anthropic/claude-opus-5-5"], { compactAt: 500_000 });
+  assert.deepEqual(resolveThresholds(settings, "anthropic/claude-opus-5-5", 1_000_000), {
+    compactTokens: 500_000,
+  });
+  assert.deepEqual(resolveThresholds(settings, "a/b", 100_000), { compactTokens: 80_000 });
 });
 
 test("instructions direct the model to a Markdown state file without context statistics", () => {
