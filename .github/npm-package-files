@@ -3,3 +3,7 @@ LICENSE
 README.md
 extensions/index.ts
 package.json
+src/extension.ts
+src/instructions.ts
+src/pi-version.ts
+src/settings.ts
