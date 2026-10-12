@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { Type } from "typebox";
 import {
@@ -8,6 +11,7 @@ import {
   type FauxResponseFactory,
   type Message,
 } from "@earendil-works/pi-ai";
+import type { AgentSession, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import {
   CONTINUATION_TYPE,
   INSTRUCTION_TYPE,
@@ -87,6 +91,32 @@ test("records each stage once and keeps its system message at a fixed position",
   }
 });
 
+test("messages that share a timestamp keep the instruction at its anchor", async (t) => {
+  // Every message gets the same millisecond, as fast or queued messages can.
+  t.mock.method(Date, "now", () => 1_791_000_000_000);
+  const { runtime, faux, errors } = await testRuntime({ default: { compactAt: 20000 } });
+  try {
+    const seen: Message[][] = [];
+    const record: FauxResponseFactory = (context) => {
+      seen.push(context.messages);
+      return fauxAssistantMessage("ok");
+    };
+    faux.setResponses([record, record, record, record]);
+    await runtime.session.prompt("first small request");
+    await runtime.session.prompt(`second request ${filler(20000)}`);
+    await runtime.session.prompt("third small request");
+    await runtime.session.prompt("fourth small request");
+    const second = laterSystemMessages(seen[1] ?? []);
+    assert.equal(second.length, 1);
+    assert.match(second[0]?.after ?? "", /^second request/);
+    assert.deepEqual(laterSystemMessages(seen[2] ?? []), second);
+    assert.deepEqual(laterSystemMessages(seen[3] ?? []), second);
+    assert.deepEqual(errors, []);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
 test("a single jump past both thresholds records one self-contained compaction instruction", async () => {
   const { runtime, faux, errors } = await testRuntime(SETTINGS);
   try {
@@ -139,6 +169,82 @@ test("without prepareAt, only the self-contained compaction instruction is poste
     assert.deepEqual(errors, []);
   } finally {
     await runtime.dispose();
+  }
+});
+
+/** Later system messages in one request that passes the compaction threshold. */
+async function instructionsAfterLargeRequest(
+  options: Parameters<typeof testRuntime>[4],
+  settings: unknown = SETTINGS,
+): Promise<string[]> {
+  const { runtime, faux, errors } = await testRuntime(settings, undefined, "print", false, options);
+  try {
+    let messages: Message[] = [];
+    faux.setResponses([
+      (context) => {
+        messages = context.messages;
+        return fauxAssistantMessage("ok");
+      },
+    ]);
+    await runtime.session.prompt(`large request ${filler(21000)}`);
+    assert.deepEqual(errors, []);
+    return laterSystemMessages(messages).map((message) => message.text);
+  } finally {
+    await runtime.dispose();
+  }
+}
+
+/** A stand-in pi-openai-codex-compat package at `version` that registers its settings command. */
+async function codexCompatPackage(version: string): Promise<{ entry: string; root: string }> {
+  const root = await mkdtemp(join(tmpdir(), "pi-compact-assistant-codex-compat-"));
+  const packageRoot = join(root, "node_modules", "pi-openai-codex-compat");
+  await mkdir(join(packageRoot, "extensions"), { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({ name: "pi-openai-codex-compat", version }),
+  );
+  const entry = join(packageRoot, "extensions", "index.ts");
+  await writeFile(
+    entry,
+    'export default function (pi) { pi.registerCommand("codex-settings", { description: "Codex settings", handler() {} }); }\n',
+  );
+  return { entry, root };
+}
+
+test("only supported providers and models receive instructions", async () => {
+  assert.equal((await instructionsAfterLargeRequest({})).length, 1);
+  assert.equal((await instructionsAfterLargeRequest({ provider: "openai-codex" })).length, 1);
+  // Another provider, even with an explicit entry, and a model that would fold system messages.
+  assert.deepEqual(
+    await instructionsAfterLargeRequest(
+      { provider: "opencode" },
+      { models: { "opencode/faux-1": { compactAt: 20000 } } },
+    ),
+    [],
+  );
+  assert.deepEqual(await instructionsAfterLargeRequest({ midConversation: false }), []);
+});
+
+test("Codex models require pi-openai-codex-compat 0.0.23 or later when it is loaded", async () => {
+  for (const [version, expected] of [
+    ["0.0.22", 0],
+    ["0.0.23-alpha.1", 0],
+    ["0.0.23", 1],
+    ["0.1.0", 1],
+  ] as const) {
+    const compat = await codexCompatPackage(version);
+    try {
+      const codex = await instructionsAfterLargeRequest({
+        provider: "openai-codex",
+        extensionPaths: [compat.entry],
+      });
+      assert.equal(codex.length, expected, version);
+      // Anthropic models do not depend on the Codex extension.
+      const anthropic = await instructionsAfterLargeRequest({ extensionPaths: [compat.entry] });
+      assert.equal(anthropic.length, 1, version);
+    } finally {
+      await rm(compat.root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -284,6 +390,93 @@ test("an aborted run cancels the accepted request and tells the model", async ()
   } finally {
     await runtime.dispose();
   }
+});
+
+/** Notice texts and branch shape after a user-requested compact call that `interrupt` disturbs. */
+async function interruptedRequest(
+  interrupt: (pi: Parameters<ExtensionFactory>[0], session: () => AgentSession) => void,
+) {
+  let current: (() => AgentSession) | undefined;
+  const { runtime, faux, errors } = await testRuntime({ default: false }, (pi) => {
+    interrupt(pi, () => {
+      assert.ok(current);
+      return current();
+    });
+  });
+  current = () => runtime.session;
+  try {
+    faux.setResponses([fauxAssistantMessage("ok")]);
+    await runtime.session.prompt(`earlier request ${filler(21000)}`);
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("compact", { message: "Continue" })),
+      fauxAssistantMessage("Summary: the earlier request was handled."),
+      fauxAssistantMessage("READY"),
+    ]);
+    await runtime.session.prompt(`compact now ${filler(300)}`);
+    const notices = () =>
+      runtime.session.sessionManager
+        .getEntries()
+        .filter((entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE);
+    await waitUntil(() => notices().length > 0);
+    await runtime.session.waitForIdle();
+    const entries = runtime.session.sessionManager.getEntries();
+    assert.deepEqual(errors, []);
+    return {
+      notices: notices().map((entry) =>
+        JSON.stringify(entry.type === "custom_message" && entry.content),
+      ),
+      compacted: entries.some((entry) => entry.type === "compaction"),
+      continued: entries.some(
+        (entry) => entry.type === "custom_message" && entry.customType === CONTINUATION_TYPE,
+      ),
+    };
+  } finally {
+    await runtime.dispose();
+  }
+}
+
+test("a failed compaction cancels the request and tells the model", async () => {
+  const result = await interruptedRequest((pi) => {
+    pi.on("session_before_compact", () => ({ cancel: true }));
+  });
+  assert.equal(result.notices.length, 1);
+  assert.match(result.notices[0] ?? "", /did not run: Compaction cancelled/);
+  assert.equal(result.compacted, false);
+  assert.equal(result.continued, false);
+});
+
+test("user input during compaction withholds the continuation", async () => {
+  const result = await interruptedRequest((pi, session) => {
+    pi.on("session_before_compact", async () => {
+      await session().followUp("newer input");
+    });
+  });
+  assert.equal(result.notices.length, 1);
+  assert.match(
+    result.notices[0] ?? "",
+    /ran, but your continuation message was not delivered: User input arrived during compaction\./,
+  );
+  assert.equal(result.compacted, true);
+  assert.equal(result.continued, false);
+});
+
+test("a branch change before compaction cancels the request", async () => {
+  const result = await interruptedRequest((pi, session) => {
+    let navigated = false;
+    pi.on("agent_settled", async () => {
+      if (navigated) return;
+      const prompt = session()
+        .sessionManager.getBranch()
+        .findLast((entry) => entry.type === "message" && entry.message.role === "user");
+      if (!prompt || !JSON.stringify(prompt).includes("compact now")) return;
+      navigated = true;
+      await session().navigateTree(prompt.id, { summarize: false });
+    });
+  });
+  assert.equal(result.notices.length, 1);
+  assert.match(result.notices[0] ?? "", /did not run: The session branch changed\./);
+  assert.equal(result.compacted, false);
+  assert.equal(result.continued, false);
 });
 
 test("models set to false and invalid settings leave requests unchanged", async () => {

@@ -17,6 +17,7 @@ import {
 } from "./instructions.ts";
 import { requirePiVersion } from "./pi-version.ts";
 import { loadSettings, resolveThresholds, type Settings } from "./settings.ts";
+import { findCodexCompatProblem, unsupportedReason } from "./support.ts";
 
 export const INSTRUCTION_TYPE = "pi-compact-assistant:instruction";
 export const CONTINUATION_TYPE = "pi-compact-assistant:continuation";
@@ -96,12 +97,27 @@ export function activeInstructions(branch: readonly SessionEntry[]): Instruction
   return records;
 }
 
+/** The fields {@link sameMessage} compares. */
+function messageKey(message: ContextMessage): string {
+  return JSON.stringify([
+    message.role,
+    message.timestamp,
+    message.role === "toolResult" ? message.toolCallId : null,
+  ]);
+}
+
 function sameMessage(left: ContextMessage, right: ContextMessage): boolean {
   if (left.role !== right.role || left.timestamp !== right.timestamp) return false;
   if (left.role === "toolResult" && right.role === "toolResult") {
     return left.toolCallId === right.toolCallId;
   }
   return true;
+}
+
+interface Anchor {
+  message: ContextMessage;
+  /** How many earlier session messages match it, so equal timestamps resolve to the same one. */
+  occurrence: number;
 }
 
 /**
@@ -114,15 +130,29 @@ export function injectInstructions(
   records: readonly InstructionRecord[],
   projection: Projection,
 ): ContextMessage[] {
-  const anchors = new Map<string, ContextMessage>();
+  const anchors = new Map<string, Anchor>();
+  const seen = new Map<string, number>();
   for (const entry of projection.entries) {
+    for (const message of entry.messages) {
+      const key = messageKey(message);
+      seen.set(key, (seen.get(key) ?? 0) + 1);
+    }
     const last = entry.messages.at(-1);
-    if (last) anchors.set(entry.sourceEntry.id, last);
+    if (last) {
+      anchors.set(entry.sourceEntry.id, {
+        message: last,
+        occurrence: (seen.get(messageKey(last)) ?? 1) - 1,
+      });
+    }
   }
   const inserts = new Map<number, ContextMessage[]>();
   for (const record of records) {
     const anchor = anchors.get(record.anchorEntryId);
-    const index = anchor ? messages.findLastIndex((message) => sameMessage(message, anchor)) : -1;
+    const matches = anchor
+      ? messages.flatMap((message, index) => (sameMessage(message, anchor.message) ? [index] : []))
+      : [];
+    // Several messages can share a role and millisecond. Take the anchor's own occurrence.
+    const index = anchor ? (matches[anchor.occurrence] ?? matches.at(-1) ?? -1) : -1;
     const position = index < 0 ? messages.length - 1 : index;
     const system: ContextMessage = {
       role: "system",
@@ -160,6 +190,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
   requirePiVersion("pi-compact-assistant");
   const settingsDirectory = options.settingsDirectory ?? getAgentDir;
   let settings: Settings | undefined;
+  let codexCompatProblem: string | undefined;
   let pending: Request | undefined;
   let epoch = 0;
   const reported = new Set<string>();
@@ -171,11 +202,12 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
   }
 
   function assertCurrent(request: Request, ctx: ExtensionContext): void {
-    if (epoch !== request.epoch) throw new Error("User input arrived before compaction.");
-    if (ctx.hasPendingMessages()) throw new Error("Queued input must be handled first.");
+    // A tree navigation also counts as input, so check the branch first to name the cause.
     const branch = ctx.sessionManager.getBranch();
     const start = branch.findIndex((entry) => entry.id === request.assistantId);
     if (start < 0) throw new Error("The session branch changed.");
+    if (epoch !== request.epoch) throw new Error("User input arrived before compaction.");
+    if (ctx.hasPendingMessages()) throw new Error("Queued input must be handled first.");
     if (
       branch
         .slice(start + 1)
@@ -189,13 +221,15 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     }
   }
 
-  function stop(request: Request, ctx: ExtensionContext, error: unknown): void {
+  function stop(request: Request, ctx: ExtensionContext, error: unknown, compacted = false): void {
     if (pending === request) pending = undefined;
     const reason = errorText(error);
     pi.sendMessage(
       {
         customType: NOTICE_TYPE,
-        content: `Compaction requested with ${COMPACT_TOOL_NAME} did not run: ${reason} Nothing was retried. Your continuation message was not delivered.`,
+        content: compacted
+          ? `Compaction requested with ${COMPACT_TOOL_NAME} ran, but your continuation message was not delivered: ${reason} Continue from the conversation and the newer input.`
+          : `Compaction requested with ${COMPACT_TOOL_NAME} did not run: ${reason} Nothing was retried. Your continuation message was not delivered.`,
         display: true,
         details: { requestId: request.id },
       },
@@ -213,6 +247,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       settings = undefined;
       report(ctx, "settings", `pi-compact-assistant is inactive. ${errorText(error)}`);
     }
+    codexCompatProblem = await findCodexCompatProblem(pi);
   });
   pi.on("session_shutdown", () => {
     pending = undefined;
@@ -238,6 +273,18 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       thresholds = usage ? resolveThresholds(settings, key, usage.contextWindow) : undefined;
     } catch (error) {
       report(ctx, `thresholds:${key}`, `pi-compact-assistant skips ${key}. ${errorText(error)}`);
+    }
+    // Unsupported models get no instructions, including ones recorded under another model.
+    const unsupported = unsupportedReason(model, codexCompatProblem);
+    if (unsupported) {
+      // Models covered only by the default stay quiet; explicit entries and old compat do not.
+      if (
+        thresholds &&
+        (Object.hasOwn(settings.models, key) || unsupported === codexCompatProblem)
+      ) {
+        report(ctx, `support:${key}`, `pi-compact-assistant skips ${key}. ${unsupported}`);
+      }
+      return undefined;
     }
     const stage =
       thresholds && usage?.tokens != null ? reachedStage(usage.tokens, thresholds) : undefined;
@@ -321,11 +368,12 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
             onError: reject,
           });
         });
-        if (epoch !== request.epoch || ctx.hasPendingMessages() || !ctx.isIdle()) {
-          throw new Error("User input arrived during compaction.");
-        }
       } catch (error) {
         stop(request, ctx, error);
+        return;
+      }
+      if (epoch !== request.epoch || ctx.hasPendingMessages() || !ctx.isIdle()) {
+        stop(request, ctx, new Error("User input arrived during compaction."), true);
         return;
       }
       pending = undefined;

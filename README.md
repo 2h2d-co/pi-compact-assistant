@@ -113,11 +113,22 @@ instruction was never posted, because usage passed both thresholds at once or th
 `prepareAt`, it posts a self-contained `[Compaction required]` instruction instead. That instruction asks the model to
 record the state in a Markdown state file under the same rules before calling `compact`.
 
-Pi sends later system messages in place only to models that accept them mid-conversation. Pi 1.1.0
-marks Claude Fable 5, Fable 5.1, Opus 4.8, Opus 5, Opus 5.5, Sonnet 5.5, and Haiku 5.5, and the
-Codex GPT-5.5, GPT-5.6, GPT-6, and GPT-6.1 models this way. For other models, Pi folds the instruction into the leading
-system prompt. That changes the prompt prefix once per stage, which invalidates the prompt cache
-for that request.
+### Supported models
+
+The extension instructs only models that meet all of these conditions:
+
+- the provider is `anthropic` or `openai-codex`, the request paths the live tests cover;
+- Pi marks the model as accepting system messages mid-conversation. Pi 1.1.0 marks Claude Fable 5,
+  Fable 5.1, Opus 4.8, Opus 5, Opus 5.5, Sonnet 5.5, and Haiku 5.5, and the Codex GPT-5.5,
+  GPT-5.6, GPT-6, and GPT-6.1 models this way. For other models Pi would fold each instruction
+  into the leading system prompt, which changes the cached prefix; and
+- for `openai-codex`, a loaded `pi-openai-codex-compat` is 0.0.23 or later. The extension reads
+  its version from the loaded package. Older versions drop the instructions from Codex requests.
+
+Other models get no instructions, even ones recorded while a supported model was selected. A model
+with its own settings entry, or any Codex model with an outdated `pi-openai-codex-compat`, shows an
+error once per session in interactive and RPC sessions. Models covered only by `default` are
+skipped silently. The `compact` tool stays available to every model.
 
 ## `compact`
 
@@ -145,9 +156,12 @@ resumes the agent. The continuation states that it is not a new user request or 
 The request is cancelled, and the model is told, when:
 
 - the run is aborted;
-- the user sends input or queues a message before compaction finishes;
-- the session branch changes or the conversation advances; or
+- the user sends input or queues a message before compaction starts;
+- the session branch changes or the conversation advances before compaction starts; or
 - compaction fails or another extension cancels it.
+
+If user input arrives while compaction runs, the compaction completes but the continuation is
+withheld, and the notice says so.
 
 Cancelled requests are never retried or replayed. `compact` changes conversation context only,
 never files, processes, or permissions.
@@ -156,6 +170,8 @@ never files, processes, or permissions.
 
 - **`pi-anthropic-compat`**: the native Anthropic compaction handles `compact`. Live tests pass
   with Claude Fable 5.1.
+- Without a compat extension, Pi's built-in Anthropic provider receives the instructions as system
+  messages, and Pi writes the summary. Live tests pass with Claude Fable 5.1.
 - **`pi-openai-codex-compat`** 0.0.23 or later: Codex remote compaction handles `compact`, and the
   instructions reach Codex as developer messages. Live tests pass with GPT-6.1 Sol. Version 0.0.22
   and earlier drop the instructions, because they build Codex requests only from the stored session.
@@ -177,8 +193,10 @@ npm run pack:dry
 `npm run test:live` packs the extension and runs the packaged Pi CLI against real providers. It
 uses your Pi login through an isolated agent directory, loads the pinned system prompt patcher and
 the provider's compat extension, and checks that both instructions reach the provider payload, the
-model calls `compact`, compaction runs, and the agent resumes with earlier facts intact. Release
-validation runs it against the exact release archive.
+model calls `compact`, compaction runs, and the agent resumes with earlier facts intact. Further
+scenarios ask the model to compact, then abort the run, change the session branch, cancel the
+compaction, or send user input during it, and check that the continuation is withheld with a
+notice. Release validation runs it against the exact release archive.
 
 ## Packaging
 

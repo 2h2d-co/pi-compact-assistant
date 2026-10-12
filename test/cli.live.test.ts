@@ -14,12 +14,13 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { getAgentDir, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import manifest from "../package.json" with { type: "json" };
-import { CONTINUATION_TYPE, INSTRUCTION_TYPE } from "../src/extension.ts";
+import { CONTINUATION_TYPE, INSTRUCTION_TYPE, NOTICE_TYPE } from "../src/extension.ts";
 import { SETTINGS_FILE_NAME } from "../src/settings.ts";
+import { CANCEL_MODE_ENV, type CancelMode } from "./cancel-probe.ts";
 import { archiveEntries, expectedArchiveEntries, packageArchive } from "./package-archive.ts";
 import { isolatePromptPatcher } from "./prompt-patcher.ts";
 import { PROBE_TYPE, type ProbedInstruction } from "./wire-probe.ts";
@@ -96,6 +97,107 @@ function outline(entries: readonly SessionEntry[]): string {
  * provider, and expects the model to call `compact`, compaction to run through the compat
  * extension, and the continuation to resume the agent with the project facts intact.
  */
+interface Scenario {
+  provider: string;
+  model: string;
+  role: string;
+  compat: string | undefined;
+  settings: { file: string; value: unknown } | undefined;
+}
+
+/**
+ * Unpack the release candidate and prepare isolated agent state with the real login, the pinned
+ * prompt patcher, and the scenario's compat extension. Returns RPC client options for Pi.
+ */
+async function prepareLive(t: TestContext, scenario: Scenario, cancel?: CancelMode) {
+  const temporary = await mkdtemp(join(tmpdir(), "pi-compact-assistant-live-"));
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+  // A release passes its exact staged-index archive; otherwise pack this worktree.
+  const archive = await packageArchive(root, temporary, process.env["PI_PACKAGE_ARCHIVE"]);
+  assert.deepEqual(await archiveEntries(archive), await expectedArchiveEntries(root));
+  execFileSync("tar", ["-xzf", archive, "-C", temporary]);
+  const packageRoot = join(temporary, "package");
+  // Installed packages have no node_modules: every Pi import must resolve through Pi's aliases.
+  assert.equal(existsSync(join(packageRoot, "node_modules")), false);
+
+  const cli = await realpath(
+    process.env["PI_TEST_CLI_PATH"] ??
+      join(root, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
+  );
+  const piRoot = resolve(dirname(cli), "../..");
+  const piManifest: unknown = JSON.parse(await readFile(join(piRoot, "package.json"), "utf8"));
+  assert.ok(typeof piManifest === "object" && piManifest !== null && "version" in piManifest);
+  assert.equal(
+    piManifest.version,
+    piVersion,
+    "Live validation requires the Pi version pinned as the development dependency.",
+  );
+  const loaded: unknown = await import(
+    pathToFileURL(join(piRoot, "dist/modes/rpc/rpc-client.js")).href
+  );
+  assert.ok(isRpcClientModule(loaded), `Pi at ${piRoot} does not export RpcClient.`);
+
+  // Isolated agent state with the real login, the pinned patcher, and the compat extension.
+  const realAgentDir = getAgentDir();
+  const agent = join(temporary, "agent");
+  await mkdir(agent);
+  await symlink(join(realAgentDir, "auth.json"), join(agent, "auth.json"));
+  if (existsSync(join(realAgentDir, "APPEND_SYSTEM.md"))) {
+    await copyFile(join(realAgentDir, "APPEND_SYSTEM.md"), join(agent, "APPEND_SYSTEM.md"));
+  }
+  await isolatePromptPatcher({
+    sourceAgentDir: realAgentDir,
+    agentDir: agent,
+    provider: scenario.provider,
+    model: scenario.model,
+  });
+  await writeFile(
+    join(agent, "settings.json"),
+    JSON.stringify({
+      retry: { enabled: false, provider: { maxRetries: 0 } },
+      compaction: { enabled: false, keepRecentTokens: 1 },
+    }),
+  );
+  if (scenario.settings) {
+    await writeFile(join(agent, scenario.settings.file), JSON.stringify(scenario.settings.value));
+  }
+  const settingsFile = join(agent, SETTINGS_FILE_NAME);
+  await writeFile(settingsFile, JSON.stringify({ default: false }));
+  const work = join(temporary, "work");
+  await mkdir(work);
+  await writeFile(join(work, "facts.txt"), `${FACTS}\n`);
+  await writeFile(join(work, "pad1.txt"), pad(3000, "amber"));
+  await writeFile(join(work, "pad2.txt"), pad(7000, "cobalt"));
+
+  const options = {
+    cliPath: cli,
+    cwd: work,
+    provider: scenario.provider,
+    model: scenario.model,
+    env: {
+      PI_CODING_AGENT_DIR: agent,
+      PI_TELEMETRY: "0",
+      ...(cancel ? { [CANCEL_MODE_ENV]: cancel } : {}),
+    },
+    args: [
+      "--thinking",
+      "low",
+      "--session",
+      join(temporary, "session.jsonl"),
+      // The branch fixture must load first so its settled handler dispatches first.
+      ...(cancel ? ["-e", join(root, "test/cancel-probe.ts")] : []),
+      "-e",
+      packageRoot,
+      ...(scenario.compat ? ["-e", join(root, "node_modules", scenario.compat)] : []),
+      "-e",
+      join(root, "node_modules/pi-system-prompt-patcher"),
+      "-e",
+      join(root, "test/wire-probe.ts"),
+    ],
+  };
+  return { loaded, options, settingsFile, work };
+}
+
 const anthropicCompatSettings = {
   file: "pi-anthropic-compat.json",
   value: { enabled: true, keepRecentTokens: 0 },
@@ -117,6 +219,15 @@ const scenarios = [
     compat: "pi-anthropic-compat",
     settings: anthropicCompatSettings,
     compactOnly: true,
+  },
+  // Pi's built-in Anthropic provider sends the instructions and summarizes with Pi's compaction.
+  {
+    provider: "anthropic",
+    model: "claude-fable-5-1",
+    role: "system",
+    compat: undefined,
+    settings: undefined,
+    compactOnly: false,
   },
   {
     provider: "openai-codex",
@@ -140,88 +251,7 @@ for (const scenario of scenarios) {
     `live packaged Pi CLI ${scenario.provider}/${scenario.model} ${scenario.compat ? `with ${scenario.compat}` : "without a compat extension"}${scenario.compactOnly ? " with only compactAt" : ""} instructs, compacts, and resumes`,
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 900_000 },
     async (t) => {
-      const temporary = await mkdtemp(join(tmpdir(), "pi-compact-assistant-live-"));
-      t.after(() => rm(temporary, { recursive: true, force: true }));
-      // A release passes its exact staged-index archive; otherwise pack this worktree.
-      const archive = await packageArchive(root, temporary, process.env["PI_PACKAGE_ARCHIVE"]);
-      assert.deepEqual(await archiveEntries(archive), await expectedArchiveEntries(root));
-      execFileSync("tar", ["-xzf", archive, "-C", temporary]);
-      const packageRoot = join(temporary, "package");
-      // Installed packages have no node_modules: every Pi import must resolve through Pi's aliases.
-      assert.equal(existsSync(join(packageRoot, "node_modules")), false);
-
-      const cli = await realpath(
-        process.env["PI_TEST_CLI_PATH"] ??
-          join(root, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
-      );
-      const piRoot = resolve(dirname(cli), "../..");
-      const piManifest: unknown = JSON.parse(await readFile(join(piRoot, "package.json"), "utf8"));
-      assert.ok(typeof piManifest === "object" && piManifest !== null && "version" in piManifest);
-      assert.equal(
-        piManifest.version,
-        piVersion,
-        "Live validation requires the Pi version pinned as the development dependency.",
-      );
-      const loaded: unknown = await import(
-        pathToFileURL(join(piRoot, "dist/modes/rpc/rpc-client.js")).href
-      );
-      assert.ok(isRpcClientModule(loaded), `Pi at ${piRoot} does not export RpcClient.`);
-
-      // Isolated agent state with the real login, the pinned patcher, and the compat extension.
-      const realAgentDir = getAgentDir();
-      const agent = join(temporary, "agent");
-      await mkdir(agent);
-      await symlink(join(realAgentDir, "auth.json"), join(agent, "auth.json"));
-      if (existsSync(join(realAgentDir, "APPEND_SYSTEM.md"))) {
-        await copyFile(join(realAgentDir, "APPEND_SYSTEM.md"), join(agent, "APPEND_SYSTEM.md"));
-      }
-      await isolatePromptPatcher({
-        sourceAgentDir: realAgentDir,
-        agentDir: agent,
-        provider: scenario.provider,
-        model: scenario.model,
-      });
-      await writeFile(
-        join(agent, "settings.json"),
-        JSON.stringify({
-          retry: { enabled: false, provider: { maxRetries: 0 } },
-          compaction: { enabled: false, keepRecentTokens: 1 },
-        }),
-      );
-      if (scenario.settings) {
-        await writeFile(
-          join(agent, scenario.settings.file),
-          JSON.stringify(scenario.settings.value),
-        );
-      }
-      const settingsFile = join(agent, SETTINGS_FILE_NAME);
-      await writeFile(settingsFile, JSON.stringify({ default: false }));
-      const work = join(temporary, "work");
-      await mkdir(work);
-      await writeFile(join(work, "facts.txt"), `${FACTS}\n`);
-      await writeFile(join(work, "pad1.txt"), pad(3000, "amber"));
-      await writeFile(join(work, "pad2.txt"), pad(7000, "cobalt"));
-
-      const options = {
-        cliPath: cli,
-        cwd: work,
-        provider: scenario.provider,
-        model: scenario.model,
-        env: { PI_CODING_AGENT_DIR: agent, PI_TELEMETRY: "0" },
-        args: [
-          "--thinking",
-          "low",
-          "--session",
-          join(temporary, "session.jsonl"),
-          "-e",
-          packageRoot,
-          ...(scenario.compat ? ["-e", join(root, "node_modules", scenario.compat)] : []),
-          "-e",
-          join(root, "node_modules/pi-system-prompt-patcher"),
-          "-e",
-          join(root, "test/wire-probe.ts"),
-        ],
-      };
+      const { loaded, options, settingsFile, work } = await prepareLive(t, scenario);
       let client: RpcClient = new loaded.RpcClient(options);
       t.after(async () => client.stop());
 
@@ -371,6 +401,104 @@ for (const scenario of scenarios) {
       }
       t.diagnostic(
         `Pi ${piVersion} with ${scenario.compat ?? "no compat extension"}: ${scenario.compactOnly ? "the self-contained compact instruction" : "prepare and compact instructions"} reached ${scenario.provider}/${scenario.model} as ${scenario.role} items; the model compacted and resumed.`,
+      );
+    },
+  );
+}
+
+/** Entries after each poll until `done` holds and the session is idle, or two minutes pass. */
+async function settledEntries(
+  client: RpcClient,
+  done: (entries: readonly SessionEntry[]) => boolean,
+): Promise<SessionEntry[]> {
+  let entries: SessionEntry[] = [];
+  for (let attempt = 0; attempt < 60; attempt++) {
+    ({ entries } = await client.getEntries());
+    if (done(entries) && !(await client.getState()).isStreaming) return entries;
+    await setTimeout(2000);
+  }
+  return entries;
+}
+
+/**
+ * Each way an accepted request is cancelled, through the packaged CLI and a real model that the
+ * user asks to compact. The fixture or the RPC client interrupts at the point a user would.
+ */
+const cancellations: { mode: CancelMode; notice: RegExp; compacted: boolean }[] = [
+  { mode: "abort", notice: /did not run: The run was aborted\./, compacted: false },
+  { mode: "branch", notice: /did not run: The session branch changed\./, compacted: false },
+  { mode: "fail", notice: /did not run: Compaction cancelled/, compacted: false },
+  {
+    mode: "input",
+    notice:
+      /ran, but your continuation message was not delivered: User input arrived during compaction\./,
+    compacted: true,
+  },
+];
+const cancellationScenario = scenarios[0];
+for (const cancellation of cancellations) {
+  test(
+    `live packaged Pi CLI cancels an accepted compact request on ${cancellation.mode}`,
+    { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
+    async (t) => {
+      assert.ok(cancellationScenario);
+      const { loaded, options } = await prepareLive(t, cancellationScenario, cancellation.mode);
+      const client: RpcClient = new loaded.RpcClient(options);
+      t.after(async () => client.stop());
+      await client.start();
+      let followUp: Promise<unknown> | undefined;
+      if (cancellation.mode === "input") {
+        // A user follow-up arrives while the compaction runs.
+        client.onEvent((event) => {
+          if (event.type === "compaction_start" && !followUp) {
+            followUp = client.followUp("Reply with only the word READY.");
+          }
+        });
+      }
+      await client.promptAndWait(
+        "Do not read or write files. Call the compact tool now as your only tool call, with the message: Reply with only the word RESUMED.",
+        undefined,
+        240_000,
+      );
+      const entries = await settledEntries(client, (current) =>
+        current.some(
+          (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
+        ),
+      );
+      assert.doesNotMatch(client.getStderr(), /Extension error|Failed to load extension/);
+      assert.ok(
+        entries.some(
+          (entry) =>
+            entry.type === "message" &&
+            entry.message.role === "assistant" &&
+            entry.message.content.some(
+              (block) => block.type === "toolCall" && block.name === "compact",
+            ),
+        ),
+        `The model called compact. Entries: ${outline(entries)}`,
+      );
+      const notice = entries.find(
+        (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
+      );
+      assert.ok(
+        notice?.type === "custom_message",
+        `A notice was sent. Entries: ${outline(entries)}`,
+      );
+      assert.match(JSON.stringify(notice.content), cancellation.notice);
+      assert.equal(
+        entries.some(
+          (entry) => entry.type === "custom_message" && entry.customType === CONTINUATION_TYPE,
+        ),
+        false,
+        "The continuation message is withheld.",
+      );
+      assert.equal(
+        entries.some((entry) => entry.type === "compaction"),
+        cancellation.compacted,
+      );
+      if (followUp) await followUp;
+      t.diagnostic(
+        `Pi ${piVersion} with ${cancellationScenario.compat ?? "no compat extension"}: ${cancellation.mode} cancelled the request with a notice${cancellation.compacted ? " after compaction ran" : ""}.`,
       );
     },
   );

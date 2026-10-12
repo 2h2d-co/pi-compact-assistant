@@ -7,3 +7,4 @@ src/extension.ts
 src/instructions.ts
 src/pi-version.ts
 src/settings.ts
+src/support.ts

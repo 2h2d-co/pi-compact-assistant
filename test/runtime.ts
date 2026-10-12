@@ -22,6 +22,15 @@ import { SETTINGS_FILE_NAME } from "../src/settings.ts";
 export const SYSTEM_INSTRUCTIONS = "Base test instructions: Never deploy without approval.";
 export const CONTEXT_WINDOW = 100_000;
 
+export interface RuntimeOptions {
+  /** Provider name of the scripted model. Defaults to the supported `anthropic`. */
+  provider?: string;
+  /** Whether the scripted model accepts mid-conversation system messages. Defaults to true. */
+  midConversation?: boolean;
+  /** Extension files Pi loads from disk, so their source metadata names real paths. */
+  extensionPaths?: string[];
+}
+
 /**
  * A real Pi runtime with an offline scripted provider, a private temporary agent home, and
  * the extension's settings file written there. Pi's automatic compaction is off.
@@ -31,6 +40,7 @@ export async function testRuntime(
   extra?: ExtensionFactory,
   mode: "tui" | "rpc" | "print" | "json" = "print",
   entry = false,
+  options: RuntimeOptions = {},
 ) {
   const cwd = await mkdtemp(join(tmpdir(), "pi-compact-assistant-runtime-"));
   const agentDir = join(cwd, "agent");
@@ -41,7 +51,15 @@ export async function testRuntime(
     await mkdir(settingsDirectory, { recursive: true });
     await writeFile(join(settingsDirectory, SETTINGS_FILE_NAME), JSON.stringify(settings));
   }
-  const faux = fauxProvider({ models: [{ id: "faux-1", contextWindow: CONTEXT_WINDOW }] });
+  const faux = fauxProvider({
+    provider: options.provider ?? "anthropic",
+    models: [{ id: "faux-1", contextWindow: CONTEXT_WINDOW }],
+  });
+  for (const model of faux.models) {
+    Object.assign(model, {
+      compat: { supportsMidConvoSystemMessages: options.midConversation ?? true },
+    });
+  }
   const modelRuntime = await ModelRuntime.create({
     credentials: new InMemoryCredentialStore(),
     modelsPath: null,
@@ -50,7 +68,7 @@ export async function testRuntime(
     refreshOnCreate: false,
   });
   const errors: string[] = [];
-  const createRuntime: CreateAgentSessionRuntimeFactory = async (options) => {
+  const createRuntime: CreateAgentSessionRuntimeFactory = async (sessionOptions) => {
     const services = await createAgentSessionServices({
       cwd,
       agentDir,
@@ -67,9 +85,10 @@ export async function testRuntime(
         noThemes: true,
         noContextFiles: true,
         // The packaged entry reads its settings from Pi's agent directory.
-        additionalExtensionPaths: entry
-          ? [fileURLToPath(new URL("../extensions/index.ts", import.meta.url))]
-          : [],
+        additionalExtensionPaths: [
+          ...(entry ? [fileURLToPath(new URL("../extensions/index.ts", import.meta.url))] : []),
+          ...(options.extensionPaths ?? []),
+        ],
         extensionFactories: [
           {
             name: "offline-provider",
@@ -95,8 +114,10 @@ export async function testRuntime(
     return {
       ...(await createAgentSessionFromServices({
         services,
-        sessionManager: options.sessionManager,
-        ...(options.sessionStartEvent ? { sessionStartEvent: options.sessionStartEvent } : {}),
+        sessionManager: sessionOptions.sessionManager,
+        ...(sessionOptions.sessionStartEvent
+          ? { sessionStartEvent: sessionOptions.sessionStartEvent }
+          : {}),
         model: faux.getModel(),
         noTools: "builtin",
       })),
