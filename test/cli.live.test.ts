@@ -310,6 +310,24 @@ for (const scenario of scenarios) {
         (entry) => entry.type === "custom_message" && entry.customType === CONTINUATION_TYPE,
       );
       assert.ok(call >= 0, "The model called compact.");
+      // The instructions ask for a Markdown state file, and the continuation names it.
+      const callEntry = entries[call];
+      const compactCall =
+        callEntry?.type === "message" && callEntry.message.role === "assistant"
+          ? callEntry.message.content.find(
+              (block) => block.type === "toolCall" && block.name === "compact",
+            )
+          : undefined;
+      const continuationMessage =
+        compactCall?.type === "toolCall" && typeof compactCall.arguments["message"] === "string"
+          ? compactCall.arguments["message"]
+          : "";
+      const stateFile = /[\w./~-]+\.md\b/.exec(continuationMessage)?.[0];
+      assert.ok(stateFile, `The compact message names a Markdown file: ${continuationMessage}`);
+      assert.ok(
+        existsSync(resolve(work, stateFile)),
+        `The named Markdown state file exists: ${stateFile}`,
+      );
       assert.ok(call < compaction && compaction < continuation);
       const compactionEntry = entries[compaction];
       assert.ok(compactionEntry?.type === "compaction");

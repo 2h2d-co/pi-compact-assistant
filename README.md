@@ -4,10 +4,10 @@ Pi extension that lets the model compact its own conversation at a good moment, 
 automatic compaction interrupts it.
 
 - It checks context usage before every model request, including requests between tool calls.
-- At a **preparation threshold**, it tells the model to bring the current step to a stable point
-  and keep track of what a continuation needs.
-- At a **compaction threshold**, it tells the model to call the **`compact`** tool at the first
-  suitable moment.
+- At a **preparation threshold**, it tells the model to keep working and to record the work's
+  state in a Markdown file.
+- At a **compaction threshold**, it tells the model to update that file, then call the
+  **`compact`** tool at the first suitable moment with the file's path and the next step.
 - `compact` runs Pi's compaction after the turn ends, then delivers the model's continuation
   message and resumes the agent.
 
@@ -89,7 +89,14 @@ recorded instructions as system messages directly after those entries. The instr
 - are not stored as conversation messages, so summaries and later prompts never contain them;
 - stay at the same position in later requests, so prompt-cache prefixes stay valid;
 - stop after a compaction, until usage reaches a threshold again; and
-- state the measured usage, the context window, and the compaction threshold.
+- contain no usage figures, so their text is the same in every session.
+
+The preparation instruction, `[Compaction preparation]`, tells the model not to stop or wrap up
+early. Work continues after compaction as long as its state is recorded, so the model records the
+goal, constraints, decisions, changed files, validation results, running processes, and next step
+in a Markdown file and keeps it current. It names the later `[Compaction required]` instruction.
+That instruction tells the model to update the file and call `compact` with the file's path and
+the exact next step.
 
 If usage jumps past both thresholds at once, only the compaction instruction is added.
 
@@ -108,9 +115,9 @@ for that request.
 }
 ```
 
-- `message` is delivered after compaction succeeds and starts the next turn. It should be
-  self-contained: the user's goal and active constraints, completed work, validation results,
-  running processes, and the exact next step.
+- `message` is delivered after compaction succeeds and starts the next turn. It gives the path of
+  the Markdown file that records the work's state and the exact next step. The file holds the rest
+  of the state.
 - `instructions` guides the summarizer. It is passed to Pi's compaction as custom instructions.
   Pi's own summary, `pi-anthropic-compat` native compaction, and `pi-openai-codex-compat` remote
   compaction all apply them; live probes confirmed each native path. The instructions should only

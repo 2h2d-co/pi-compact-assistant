@@ -102,16 +102,25 @@ test("loads the settings file and reports invalid JSON with its path", async () 
   });
 });
 
-test("selects the highest reached stage and renders usage in the instruction", () => {
+test("selects the highest reached stage", () => {
   const thresholds = { prepareTokens: 450_000, compactTokens: 500_000 };
   assert.equal(reachedStage(449_999, thresholds), undefined);
   assert.equal(reachedStage(450_000, thresholds), "prepare");
   assert.equal(reachedStage(500_000, thresholds), "compact");
-  const text = instructionText(
-    "prepare",
-    { tokens: 452_100, contextWindow: 1_000_000 },
-    thresholds,
+});
+
+test("instructions direct the model to a Markdown state file without context statistics", () => {
+  const prepare = instructionText("prepare");
+  assert.match(prepare, /^\[Compaction preparation\]\n/);
+  assert.match(prepare, /later `\[Compaction required\]` instruction/);
+  assert.match(prepare, /Keep working\. Do not stop or wrap up early/);
+  assert.match(prepare, /Record the state in a Markdown file now/);
+  const compact = instructionText("compact");
+  assert.match(compact, /^\[Compaction required\]\n/);
+  assert.match(compact, /update the Markdown file that tracks this work/);
+  assert.match(
+    compact,
+    /`message` \(required\).*Give the path of that Markdown file and the exact next step/,
   );
-  assert.match(text, /about 452,100 of 1,000,000 tokens \(45\.2%\)/);
-  assert.match(text, /compacted at about 500,000 tokens/);
+  for (const text of [prepare, compact]) assert.doesNotMatch(text, /tokens|%/);
 });

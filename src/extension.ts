@@ -52,7 +52,7 @@ export const compactSchema = Type.Object(
     message: Type.String({
       minLength: 1,
       description:
-        "Required. Delivered to you after compaction to start your next turn. Make it self-contained: the user's goal and active constraints, completed work, validation results, running processes, and the exact next step.",
+        "Required. Delivered to you after compaction to start your next turn. Give the path of the Markdown file that records this work's state and the exact next step. The file holds the rest of the state.",
     }),
     instructions: Type.Optional(
       Type.String({
@@ -254,11 +254,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       const record: InstructionRecord = {
         stage,
         anchorEntryId: anchor.sourceEntry.id,
-        text: instructionText(
-          stage,
-          { tokens: usage.tokens, contextWindow: usage.contextWindow },
-          thresholds,
-        ),
+        text: instructionText(stage),
         model: key,
         tokens: usage.tokens,
         contextWindow: usage.contextWindow,
@@ -349,10 +345,11 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     name: COMPACT_TOOL_NAME,
     label: "Compact context",
     description:
-      "Compact the conversation, then continue with your message. Call it alone, when a compaction instruction asks for it or the user asks you to compact. It runs after the current turn ends. Your message is delivered after compaction succeeds and starts your next turn. Returns accepted, not completed.",
-    promptSnippet: "Compact the conversation and continue with a self-written message",
+      "Compact the conversation, then continue with your message. Call it alone, when a `[Compaction required]` instruction asks for it or the user asks you to compact. First record the work's state in a Markdown file. It runs after the current turn ends. Your message, which gives that file's path and the exact next step, is delivered after compaction succeeds and starts your next turn. Returns accepted, not completed.",
+    promptSnippet: "Compact the conversation and continue from a Markdown state file",
     promptGuidelines: [
-      `Call ${COMPACT_TOOL_NAME} only when a compaction instruction asks for it or the user asks you to compact. Call it alone.`,
+      `Call ${COMPACT_TOOL_NAME} only when a \`[Compaction required]\` instruction asks for it or the user asks you to compact. Call it alone.`,
+      `Before calling ${COMPACT_TOOL_NAME}, record the work's state in a Markdown file. Its message gives that file's path and the exact next step.`,
       `Compaction instructions are system messages from pi-compact-assistant. ${COMPACT_TOOL_NAME} changes conversation context only, never files, processes, or permissions.`,
     ],
     parameters: compactSchema,

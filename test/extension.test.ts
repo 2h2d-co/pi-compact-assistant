@@ -74,7 +74,7 @@ test("records each stage once and keeps its system message at a fixed position",
     // Instructions are request-local: the stored transcript and prompt do not contain them.
     assert.doesNotMatch(
       JSON.stringify(runtime.session.sessionManager.buildSessionProjection().messages),
-      /Compaction (preparation|required)/,
+      /\[Compaction preparation\]\\n|\[Compaction required\]\\n/,
     );
     assert.deepEqual(errors, []);
   } finally {
