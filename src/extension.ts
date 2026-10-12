@@ -57,7 +57,8 @@ export const compactSchema = Type.Object(
     instructions: Type.Optional(
       Type.String({
         minLength: 1,
-        description: "Optional. Tells the summarizer what to preserve.",
+        description:
+          "Optional. Tells the summarizer which parts of the conversation to preserve or emphasize. Do not add facts that are not in the conversation: native compaction can refuse them, which cancels compaction.",
       }),
     ),
   },

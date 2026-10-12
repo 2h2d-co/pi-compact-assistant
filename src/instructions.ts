@@ -45,7 +45,7 @@ export function instructionText(stage: Stage, usage: Usage, thresholds: StageThr
     `${usageText(usage)} This reached the compaction threshold of ${amount(thresholds.compactTokens)} tokens.`,
     `At the first suitable moment, call the \`${COMPACT_TOOL_NAME}\` tool alone: after your in-progress tool calls return, and before you start new work. Do not wait for the user.`,
     "- `message` (required) is delivered to you after compaction and starts your next turn. Make it self-contained: the user's goal and active constraints, completed work, validation results, running processes, and the exact next step.",
-    "- `instructions` (optional) tells the summarizer what to preserve.",
+    "- `instructions` (optional) tells the summarizer which parts of the conversation to preserve or emphasize. Do not add facts that are not in the conversation.",
     "Compaction replaces earlier conversation with a summary. It does not change files, processes, or permissions.",
   ].join("\n");
 }

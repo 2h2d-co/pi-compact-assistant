@@ -111,8 +111,11 @@ for that request.
 - `message` is delivered after compaction succeeds and starts the next turn. It should be
   self-contained: the user's goal and active constraints, completed work, validation results,
   running processes, and the exact next step.
-- `instructions` guides the summarizer. It is passed to Pi's compaction as custom instructions, so
-  compat extensions that provide native compaction receive it too.
+- `instructions` guides the summarizer. It is passed to Pi's compaction as custom instructions.
+  Pi's own summary, `pi-anthropic-compat` native compaction, and `pi-openai-codex-compat` remote
+  compaction all apply them; live probes confirmed each native path. The instructions should only
+  select or emphasize conversation content. Anthropic's native compaction refused an instruction
+  to state a fact that was not in the conversation, and a refusal cancels the compaction.
 
 The model must call `compact` alone. The tool ends the tool batch. After the run settles, the
 extension compacts the session, appends the message as an agent-authored continuation, and
