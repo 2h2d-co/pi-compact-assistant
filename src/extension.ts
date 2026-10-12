@@ -254,7 +254,8 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       const record: InstructionRecord = {
         stage,
         anchorEntryId: anchor.sourceEntry.id,
-        text: instructionText(stage),
+        // Without a preparation instruction in this cycle, the compaction instruction stands alone.
+        text: instructionText(stage === "compact" && !recorded.has("prepare") ? "combined" : stage),
         model: key,
         tokens: usage.tokens,
         contextWindow: usage.contextWindow,

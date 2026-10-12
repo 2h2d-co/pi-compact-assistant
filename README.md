@@ -98,7 +98,10 @@ in a Markdown file and keeps it current. It names the later `[Compaction require
 That instruction tells the model to update the file and call `compact` with the file's path and
 the exact next step.
 
-If usage jumps past both thresholds at once, only the compaction instruction is added.
+The extension records which instructions it posted in each compaction cycle. If usage passes
+both thresholds at once, so the preparation instruction was never posted, it posts a
+self-contained `[Compaction required]` instruction instead. That instruction asks the model to
+record the state in a Markdown file, creating one if needed, before calling `compact`.
 
 Pi sends later system messages in place only to models that accept them mid-conversation. Pi 1.1.0
 marks Claude Fable 5, Fable 5.1, Opus 4.8, Opus 5, Opus 5.5, Sonnet 5.5, and Haiku 5.5, and the

@@ -62,6 +62,8 @@ test("records each stage once and keeps its system message at a fixed position",
     assert.deepEqual(fourth[0], second[0]);
     assert.match(fourth[1]?.text ?? "", /^\[Compaction required\]/);
     assert.match(fourth[1]?.text ?? "", /call the `compact` tool alone/);
+    // After a preparation instruction, the compaction instruction refers to its Markdown file.
+    assert.match(fourth[1]?.text ?? "", /update the Markdown file that tracks this work/);
     assert.match(fourth[1]?.after ?? "", /^fourth request/);
     // The serialized bytes of an earlier request prefix remain unchanged.
     const prefix = seen[2]?.length ?? 0;
@@ -82,7 +84,7 @@ test("records each stage once and keeps its system message at a fixed position",
   }
 });
 
-test("a single jump past both thresholds records only the compaction instruction", async () => {
+test("a single jump past both thresholds records one self-contained compaction instruction", async () => {
   const { runtime, faux, errors } = await testRuntime(SETTINGS);
   try {
     let messages: Message[] = [];
@@ -96,6 +98,12 @@ test("a single jump past both thresholds records only the compaction instruction
     const later = laterSystemMessages(messages);
     assert.equal(later.length, 1);
     assert.match(later[0]?.text ?? "", /^\[Compaction required\]/);
+    // No preparation instruction was posted, so this one asks for the Markdown file itself.
+    assert.match(later[0]?.text ?? "", /record the current state in a Markdown file/);
+    const records = runtime.session.sessionManager
+      .getEntries()
+      .filter((entry) => entry.type === "custom" && entry.customType === INSTRUCTION_TYPE);
+    assert.equal(records.length, 1);
     assert.deepEqual(errors, []);
   } finally {
     await runtime.dispose();

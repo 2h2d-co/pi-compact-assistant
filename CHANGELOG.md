@@ -13,7 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   reached. Anthropic receives them as system messages and OpenAI Codex as developer messages on
   models that accept mid-conversation instructions. The preparation instruction tells the model to
   keep working and record the work's state in a Markdown file; the compaction instruction tells it
-  to update that file and call `compact`.
+  to update that file and call `compact`. When usage passes both thresholds at once, a
+  self-contained compaction instruction asks the model to record the state in a Markdown file
+  before calling `compact`.
 - Add the `compact` tool. The model calls it alone with a required continuation message, which
   gives the Markdown state file's path and the exact next step, and optional summarizer
   instructions. The extension compacts after the turn ends, then delivers the

@@ -122,5 +122,11 @@ test("instructions direct the model to a Markdown state file without context sta
     compact,
     /`message` \(required\).*Give the path of that Markdown file and the exact next step/,
   );
-  for (const text of [prepare, compact]) assert.doesNotMatch(text, /tokens|%/);
+  const combined = instructionText("combined");
+  assert.match(combined, /^\[Compaction required\]\n/);
+  assert.match(combined, /record the current state in a Markdown file: the user's goal/);
+  assert.match(combined, /or create one\. Then call the `compact` tool alone/);
+  assert.match(combined, /Give the path of that Markdown file and the exact next step/);
+  assert.doesNotMatch(combined, /later|update the Markdown file that tracks/);
+  for (const text of [prepare, compact, combined]) assert.doesNotMatch(text, /tokens|%/);
 });
