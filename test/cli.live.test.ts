@@ -366,7 +366,7 @@ for (const scenario of scenarios) {
             recorded.data !== null &&
             "text" in recorded.data &&
             typeof recorded.data.text === "string" &&
-            recorded.data.text.includes("record the current state in a Markdown file"),
+            recorded.data.text.includes("Record the current state in a Markdown state file"),
           "The compaction instruction is the self-contained one.",
         );
       }

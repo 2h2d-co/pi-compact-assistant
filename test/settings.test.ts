@@ -112,21 +112,38 @@ test("selects the highest reached stage", () => {
 test("instructions direct the model to a Markdown state file without context statistics", () => {
   const prepare = instructionText("prepare");
   assert.match(prepare, /^\[Compaction preparation\]\n/);
-  assert.match(prepare, /later `\[Compaction required\]` instruction/);
-  assert.match(prepare, /Keep working\. Do not stop or wrap up early/);
-  assert.match(prepare, /Record the state in a Markdown file now/);
-  const compact = instructionText("compact");
-  assert.match(compact, /^\[Compaction required\]\n/);
-  assert.match(compact, /update the Markdown file that tracks this work/);
+  assert.match(prepare, /A `\[Compaction required\]` instruction will ask you to call `compact`/);
   assert.match(
-    compact,
-    /`message` \(required\).*Give the path of that Markdown file and the exact next step/,
+    prepare,
+    /Keep working\. Do not stop or wrap up early\. Compaction does not end the task/,
   );
+  assert.match(prepare, /Record the state in a Markdown state file now:\n- the user's goal/);
+  assert.match(prepare, /- open questions for the user\n/);
+  assert.match(prepare, /- Never stage or commit the state file\./);
+  assert.match(prepare, /If you cannot or may not write files, skip the state file/);
+  assert.match(
+    prepare,
+    /Until `\[Compaction required\]` appears, call `compact` only if the user asks/,
+  );
+  const compact = instructionText("compact");
+  assert.match(compact, /^\[Compaction required\]\nAct now\./);
+  assert.match(compact, /Update the state file so it records the current state/);
+  assert.match(compact, /under the state file rules in `\[Compaction preparation\]`/);
   const combined = instructionText("combined");
-  assert.match(combined, /^\[Compaction required\]\n/);
-  assert.match(combined, /record the current state in a Markdown file: the user's goal/);
-  assert.match(combined, /or create one\. Then call the `compact` tool alone/);
-  assert.match(combined, /Give the path of that Markdown file and the exact next step/);
-  assert.doesNotMatch(combined, /later|update the Markdown file that tracks/);
+  assert.match(combined, /^\[Compaction required\]\nThe conversation must be compacted now\./);
+  assert.match(
+    combined,
+    /1\. Record the current state in a Markdown state file:\n {3}- the user's goal/,
+  );
+  assert.match(combined, / {3}- Never stage or commit the state file\./);
+  assert.doesNotMatch(combined, /Compaction preparation|Update the state file/);
+  for (const text of [compact, combined]) {
+    assert.match(text, /2\. After the write succeeds, or if you skipped step 1, call `compact`/);
+    assert.match(
+      text,
+      /`message` \(required\).*Give the state file's absolute path and the exact next step/,
+    );
+    assert.match(text, /If no work is pending, say so/);
+  }
   for (const text of [prepare, compact, combined]) assert.doesNotMatch(text, /tokens|%/);
 });

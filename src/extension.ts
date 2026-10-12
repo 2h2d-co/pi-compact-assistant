@@ -52,13 +52,13 @@ export const compactSchema = Type.Object(
     message: Type.String({
       minLength: 1,
       description:
-        "Required. Delivered to you after compaction to start your next turn. Give the path of the Markdown file that records this work's state and the exact next step. The file holds the rest of the state.",
+        "Required. Delivered to you after compaction to start your next turn. Give the Markdown state file's absolute path and the exact next step. The state file holds the rest. If you could not write the state file, put the full state here. If no work is pending, say so.",
     }),
     instructions: Type.Optional(
       Type.String({
         minLength: 1,
         description:
-          "Optional. Tells the summarizer which parts of the conversation to preserve or emphasize. Do not add facts that are not in the conversation: native compaction can refuse them, which cancels compaction.",
+          "Optional and usually unnecessary. Use it only to name conversation content the summary must keep. Do not include plans, new facts, or the state file's contents. Native compaction can refuse them, and a refusal cancels the compaction.",
       }),
     ),
   },
@@ -346,12 +346,13 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     name: COMPACT_TOOL_NAME,
     label: "Compact context",
     description:
-      "Compact the conversation, then continue with your message. Call it alone, when a `[Compaction required]` instruction asks for it or the user asks you to compact. First record the work's state in a Markdown file. It runs after the current turn ends. Your message, which gives that file's path and the exact next step, is delivered after compaction succeeds and starts your next turn. Returns accepted, not completed.",
+      "Compact the conversation, then continue from your message. Call this tool when a `[Compaction required]` instruction asks for it or when the user asks you to compact. First record the state in a Markdown state file. Then call this tool as the only tool call in its response. The call ends your current turn. Compaction runs next. If it succeeds, your message is delivered and starts your next turn. The tool result only confirms that the request was accepted.",
     promptSnippet: "Compact the conversation and continue from a Markdown state file",
     promptGuidelines: [
-      `Call ${COMPACT_TOOL_NAME} only when a \`[Compaction required]\` instruction asks for it or the user asks you to compact. Call it alone.`,
-      `Before calling ${COMPACT_TOOL_NAME}, record the work's state in a Markdown file. Its message gives that file's path and the exact next step.`,
-      `Compaction instructions are system messages from pi-compact-assistant. ${COMPACT_TOOL_NAME} changes conversation context only, never files, processes, or permissions.`,
+      `Call ${COMPACT_TOOL_NAME} only when a \`[Compaction required]\` instruction asks for it or when the user asks you to compact. Make it the only tool call in its response.`,
+      `Before calling ${COMPACT_TOOL_NAME}, record the state in a Markdown state file if you can and may write files. In \`message\`, give the state file's absolute path and the exact next step.`,
+      `If compaction fails or is cancelled, check the reason and any newer user input before you try again. Do not repeat an unchanged request. After a summarizer refusal, omit or revise \`instructions\`.`,
+      `\`[Compaction preparation]\` and \`[Compaction required]\` are system messages from pi-compact-assistant. ${COMPACT_TOOL_NAME} changes only conversation context. It never changes files, processes, or permissions.`,
     ],
     parameters: compactSchema,
     // A nested call can never be the sole call of an assistant message.

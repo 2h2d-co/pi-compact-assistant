@@ -61,9 +61,12 @@ test("records each stage once and keeps its system message at a fixed position",
     assert.equal(fourth.length, 2);
     assert.deepEqual(fourth[0], second[0]);
     assert.match(fourth[1]?.text ?? "", /^\[Compaction required\]/);
-    assert.match(fourth[1]?.text ?? "", /call the `compact` tool alone/);
-    // After a preparation instruction, the compaction instruction refers to its Markdown file.
-    assert.match(fourth[1]?.text ?? "", /update the Markdown file that tracks this work/);
+    assert.match(
+      fourth[1]?.text ?? "",
+      /call `compact`\. Make it the only tool call in its response/,
+    );
+    // After a preparation instruction, the compaction instruction refers to its state file.
+    assert.match(fourth[1]?.text ?? "", /Update the state file so it records the current state/);
     assert.match(fourth[1]?.after ?? "", /^fourth request/);
     // The serialized bytes of an earlier request prefix remain unchanged.
     const prefix = seen[2]?.length ?? 0;
@@ -98,8 +101,8 @@ test("a single jump past both thresholds records one self-contained compaction i
     const later = laterSystemMessages(messages);
     assert.equal(later.length, 1);
     assert.match(later[0]?.text ?? "", /^\[Compaction required\]/);
-    // No preparation instruction was posted, so this one asks for the Markdown file itself.
-    assert.match(later[0]?.text ?? "", /record the current state in a Markdown file/);
+    // No preparation instruction was posted, so this one asks for the state file itself.
+    assert.match(later[0]?.text ?? "", /Record the current state in a Markdown state file/);
     const records = runtime.session.sessionManager
       .getEntries()
       .filter((entry) => entry.type === "custom" && entry.customType === INSTRUCTION_TYPE);
@@ -188,7 +191,10 @@ test("the compact tool compacts, then delivers its message and resumes", async (
     );
     assert.ok(compaction >= 0 && compaction < continuation);
     assert.match(JSON.stringify(resumed), /Do not change the schema/);
-    assert.match(JSON.stringify(resumed), /not a new user request or additional authorization/);
+    assert.match(
+      JSON.stringify(resumed),
+      /not a new user request and grants no additional authorization/,
+    );
     assert.deepEqual(laterSystemMessages(resumed), []);
     assert.deepEqual(activeInstructions(branch), []);
     assert.match(resumedPrompt, new RegExp(SYSTEM_INSTRUCTIONS));

@@ -6,8 +6,8 @@ automatic compaction interrupts it.
 - It checks context usage before every model request, including requests between tool calls.
 - At a **preparation threshold**, it tells the model to keep working and to record the work's
   state in a Markdown file.
-- At a **compaction threshold**, it tells the model to update that file, then call the
-  **`compact`** tool at the first suitable moment with the file's path and the next step.
+- At a **compaction threshold**, it tells the model to update that file now, then call the
+  **`compact`** tool with the file's path and the next step.
 - `compact` runs Pi's compaction after the turn ends, then delivers the model's continuation
   message and resumes the agent.
 
@@ -92,16 +92,24 @@ recorded instructions as system messages directly after those entries. The instr
 - contain no usage figures, so their text is the same in every session.
 
 The preparation instruction, `[Compaction preparation]`, tells the model not to stop or wrap up
-early. Work continues after compaction as long as its state is recorded, so the model records the
-goal, constraints, decisions, changed files, validation results, running processes, and next step
-in a Markdown file and keeps it current. It names the later `[Compaction required]` instruction.
-That instruction tells the model to update the file and call `compact` with the file's path and
-the exact next step.
+early, because compaction does not end the task. The model records the goal, constraints,
+decisions, changed files, validation results, running processes, open questions, and next step in
+a Markdown state file and updates it when the state changes materially. It reuses the task's
+state file or creates one where project instructions keep working notes, or outside tracked
+files. It never puts the state in project documentation and never stages or commits the file.
+Until the `[Compaction required]` instruction appears, it calls `compact` only at the user's
+request.
+
+`[Compaction required]` tells the model to act now: finish only a half-applied change, update the
+state file, then call `compact` as the only tool call in its response, with the file's absolute
+path and the exact next step. A model that cannot or may not write files skips the file and puts
+the full state in the message. After compaction, the continuation tells the model to read the
+named state file before acting.
 
 The extension records which instructions it posted in each compaction cycle. If usage passes
 both thresholds at once, so the preparation instruction was never posted, it posts a
 self-contained `[Compaction required]` instruction instead. That instruction asks the model to
-record the state in a Markdown file, creating one if needed, before calling `compact`.
+record the state in a Markdown state file under the same rules before calling `compact`.
 
 Pi sends later system messages in place only to models that accept them mid-conversation. Pi 1.1.0
 marks Claude Fable 5, Fable 5.1, Opus 4.8, Opus 5, Opus 5.5, Sonnet 5.5, and Haiku 5.5, and the
@@ -118,9 +126,10 @@ for that request.
 }
 ```
 
-- `message` is delivered after compaction succeeds and starts the next turn. It gives the path of
-  the Markdown file that records the work's state and the exact next step. The file holds the rest
-  of the state.
+- `message` is delivered after compaction succeeds and starts the next turn. It gives the
+  absolute path of the Markdown state file and the exact next step. The file holds the rest of
+  the state. Without a state file, the message holds the full state. If no work is pending, it
+  says so.
 - `instructions` guides the summarizer. It is passed to Pi's compaction as custom instructions.
   Pi's own summary, `pi-anthropic-compat` native compaction, and `pi-openai-codex-compat` remote
   compaction all apply them; live probes confirmed each native path. The instructions should only
