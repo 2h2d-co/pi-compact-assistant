@@ -1,0 +1,62 @@
+# pi-compact-assistant
+
+Context-threshold compaction guidance and a model-callable compact tool for Pi
+
+Requires Pi `>=1.0.1 <1.1.0`.
+
+This is a Pi package. Its extension entrypoint is:
+
+```txt
+extensions/index.ts
+```
+
+## Development
+
+```bash
+mise run init
+mise run check
+npm test
+npm run pack:dry
+```
+
+## Try locally
+
+```bash
+pi -e ./extensions/index.ts
+```
+
+## Packaging
+
+`.github/npm-package-files` is the authoritative package-content allowlist used by the local release
+command and both CI jobs. Update it whenever the intended published file set changes.
+
+## Release staging
+
+Repository setup:
+
+1. When `new` creates the GitHub repository, it automatically protects `main` and `v*` tags and
+   restricts `npm-publish` to `v*` tags without a deployment reviewer or administrator bypass.
+2. Configure npm trusted publishing for `2h2d-co/pi-compact-assistant` using
+   `.github/workflows/publish.yml` and the `npm-publish` environment.
+3. Replace `.github/release-signers` if release commits use a different SSH signing key.
+
+If repository creation was skipped with `--no-github`, configure the branch, tag, and environment
+controls manually.
+
+Release flow:
+
+1. Run `npm run release -- X.Y.Z` from a clean, synchronized `main`.
+2. The release command packs the package from the staged Git index, records its SHA-256 in the
+   SSH-signed release commit, rebuilds the commit to prove reproducibility, and creates a lightweight
+   `vX.Y.Z` tag.
+3. Inspect the commit and tag, then push them atomically with
+   `git push --atomic origin main vX.Y.Z`.
+4. A read-only CI job tests, packs, and inspects the package without publishing credentials.
+5. A separate credentialed job verifies the signed commit and exact package digest before attesting
+   and staging that archive through npm trusted publishing.
+6. A final job creates the immutable GitHub release for the tag from the same verified archive,
+   its checksum, and the version's `CHANGELOG.md` section (`Unreleased` for prereleases).
+7. Approve the staged package on npmjs.com or with `npm stage approve <stage-id>`.
+
+Stable versions use `latest`; prereleases derive a non-`latest` dist-tag such as `alpha`, `beta`, or
+`rc` from their first prerelease identifier.
