@@ -153,15 +153,23 @@ The model must call `compact` alone. The tool ends the tool batch. After the run
 extension compacts the session, appends the message as an agent-authored continuation, and
 resumes the agent. The continuation states that it is not a new user request or authorization.
 
+User input sent after `compact` accepts the request waits until compaction finishes. This covers
+steering and follow-up messages sent while the run ends and input sent while compaction runs.
+Interactive sessions list the held messages above the editor. After compaction, the continuation
+is appended and the held input follows as one user message, which starts the next turn. The
+continuation tells the model that the user's message is newer and wins where they conflict.
+Input queued before `compact` runs still makes the tool refuse the request.
+
 The request is cancelled, and the model is told, when:
 
 - the run is aborted;
-- the user sends input or queues a message before compaction starts;
 - the session branch changes or the conversation advances before compaction starts; or
 - compaction fails or another extension cancels it.
 
-If user input arrives while compaction runs, the compaction completes but the continuation is
-withheld, and the notice says so.
+After a cancellation, held input is delivered after the notice. After an aborted run, it returns
+to the editor instead, as Pi does with its own queued messages. If an extension adds input while
+compaction runs, the compaction completes but the continuation is withheld, and the notice says
+so.
 
 Cancelled requests are never retried or replayed. `compact` changes conversation context only,
 never files, processes, or permissions.
@@ -194,9 +202,10 @@ npm run pack:dry
 uses your Pi login through an isolated agent directory, loads the pinned system prompt patcher and
 the provider's compat extension, and checks that both instructions reach the provider payload, the
 model calls `compact`, compaction runs, and the agent resumes with earlier facts intact. Further
-scenarios ask the model to compact, then abort the run, change the session branch, cancel the
-compaction, or send user input during it, and check that the continuation is withheld with a
-notice. Release validation runs it against the exact release archive.
+scenarios ask the model to compact, then abort the run, change the session branch, or cancel the
+compaction, and check that the continuation is withheld with a notice. Two more send user input
+after the call and during compaction, and check that the input waits for compaction and follows
+the continuation. Release validation runs it against the exact release archive.
 
 ## Packaging
 

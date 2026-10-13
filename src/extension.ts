@@ -4,6 +4,7 @@ import type {
   ContextWithSystemEvent,
   ExtensionAPI,
   ExtensionContext,
+  InputEvent,
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
@@ -23,6 +24,7 @@ export const INSTRUCTION_TYPE = "pi-compact-assistant:instruction";
 export const CONTINUATION_TYPE = "pi-compact-assistant:continuation";
 export const NOTICE_TYPE = "pi-compact-assistant:notice";
 export const APPLY_COMMAND = "compact-assistant-apply";
+export const HELD_WIDGET = "pi-compact-assistant:held";
 
 type ContextMessage = ContextWithSystemEvent["messages"][number];
 type Projection = ReturnType<ExtensionContext["sessionManager"]["buildSessionProjection"]>;
@@ -39,6 +41,12 @@ export interface InstructionRecord {
   timestamp: number;
 }
 
+/** User input that arrived after the request was accepted. It is delivered after compaction. */
+interface HeldInput {
+  text: string;
+  images: NonNullable<InputEvent["images"]>;
+}
+
 interface Request {
   id: string;
   message: string;
@@ -46,6 +54,12 @@ interface Request {
   assistantId: string;
   epoch: number;
   dispatched: boolean;
+  held: HeldInput[];
+}
+
+function preview(text: string): string {
+  const line = text.trim().split("\n", 1)[0] ?? "";
+  return line.length > 80 ? `${line.slice(0, 79)}…` : line;
 }
 
 export const compactSchema = Type.Object(
@@ -202,11 +216,9 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
   }
 
   function assertCurrent(request: Request, ctx: ExtensionContext): void {
-    // A tree navigation also counts as input, so check the branch first to name the cause.
     const branch = ctx.sessionManager.getBranch();
     const start = branch.findIndex((entry) => entry.id === request.assistantId);
-    if (start < 0) throw new Error("The session branch changed.");
-    if (epoch !== request.epoch) throw new Error("User input arrived before compaction.");
+    if (start < 0 || epoch !== request.epoch) throw new Error("The session branch changed.");
     if (ctx.hasPendingMessages()) throw new Error("Queued input must be handled first.");
     if (
       branch
@@ -221,7 +233,45 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     }
   }
 
-  function stop(request: Request, ctx: ExtensionContext, error: unknown, compacted = false): void {
+  function showHeld(request: Request, ctx: ExtensionContext): void {
+    if (!ctx.hasUI) return;
+    ctx.ui.setWidget(
+      HELD_WIDGET,
+      request.held.length > 0
+        ? request.held.map((input) => `Held until compaction finishes: ${preview(input.text)}`)
+        : undefined,
+    );
+  }
+
+  /**
+   * Deliver held user input as one user message, or return it to the editor after an abort, as
+   * Pi does with its own queues. Without a UI, input held during an aborted run is dropped.
+   */
+  function releaseHeld(request: Request, ctx: ExtensionContext, restore: boolean): void {
+    const held = request.held.splice(0);
+    showHeld(request, ctx);
+    if (held.length === 0) return;
+    const text = held.map((input) => input.text).join("\n\n");
+    if (restore) {
+      if (!ctx.hasUI) return;
+      const current = ctx.ui.getEditorText();
+      ctx.ui.setEditorText([text, current].filter((part) => part.trim()).join("\n\n"));
+      return;
+    }
+    const images = held.flatMap((input) => input.images);
+    pi.sendUserMessage(images.length > 0 ? [{ type: "text", text }, ...images] : text, {
+      deliverAs: "followUp",
+      // Pi expands a prompt template or skill command only at the start of a message.
+      expandPromptTemplates: held.length === 1,
+    });
+  }
+
+  function stop(
+    request: Request,
+    ctx: ExtensionContext,
+    error: unknown,
+    { compacted = false, aborted = false } = {},
+  ): void {
     if (pending === request) pending = undefined;
     const reason = errorText(error);
     pi.sendMessage(
@@ -236,11 +286,13 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       { triggerTurn: false },
     );
     if (ctx.hasUI) ctx.ui.notify(`Compaction stopped: ${reason}`, "error");
+    releaseHeld(request, ctx, aborted);
   }
 
   pi.on("session_start", async (_event, ctx) => {
     pending = undefined;
     reported.clear();
+    if (ctx.hasUI) ctx.ui.setWidget(HELD_WIDGET, undefined);
     try {
       settings = await loadSettings(settingsDirectory());
     } catch (error) {
@@ -256,8 +308,14 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
   pi.on("session_tree", () => {
     epoch++;
   });
-  pi.on("input", (event) => {
-    if (event.source !== "extension") epoch++;
+  // User input after an accepted request waits until compaction finishes, then follows the
+  // continuation. Input from extensions is not held.
+  pi.on("input", (event, ctx) => {
+    const request = pending;
+    if (!request || event.source === "extension") return undefined;
+    request.held.push({ text: event.text, images: event.images ?? [] });
+    showHeld(request, ctx);
+    return { action: "handled" as const };
   });
 
   pi.on("context_with_system", (event, ctx) => {
@@ -327,7 +385,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     const request = pending;
     if (!request || request.dispatched) return;
     if (event.aborted) {
-      stop(request, ctx, new Error("The run was aborted."));
+      stop(request, ctx, new Error("The run was aborted."), { aborted: true });
       return;
     }
     if (!ctx.isIdle()) return;
@@ -373,19 +431,24 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
         return;
       }
       if (epoch !== request.epoch || ctx.hasPendingMessages() || !ctx.isIdle()) {
-        stop(request, ctx, new Error("User input arrived during compaction."), true);
+        stop(request, ctx, new Error("Other input arrived during compaction."), {
+          compacted: true,
+        });
         return;
       }
       pending = undefined;
+      const userFollows = request.held.length > 0;
+      // With held input, the continuation is appended first and the user's message starts the turn.
       pi.sendMessage(
         {
           customType: CONTINUATION_TYPE,
-          content: continuationText(request.message),
+          content: continuationText(request.message, userFollows),
           display: true,
           details: { requestId: request.id },
         },
-        { triggerTurn: true },
+        { triggerTurn: !userFollows },
       );
+      releaseHeld(request, ctx, false);
       await ctx.waitForIdle();
     },
   });
@@ -426,6 +489,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
         assistantId,
         epoch,
         dispatched: false,
+        held: [],
       };
       pending = request;
       return Promise.resolve({

@@ -15,6 +15,7 @@ import {
   type AgentSession,
   type CreateAgentSessionRuntimeFactory,
   type ExtensionFactory,
+  type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { compactAssistant } from "../src/extension.ts";
 import { SETTINGS_FILE_NAME } from "../src/settings.ts";
@@ -29,6 +30,44 @@ export interface RuntimeOptions {
   midConversation?: boolean;
   /** Extension files Pi loads from disk, so their source metadata names real paths. */
   extensionPaths?: string[];
+  /** Bind a UI that records the editor text and widgets. */
+  ui?: boolean;
+}
+
+/** What the recording UI shows. */
+export interface UiState {
+  editorText: string;
+  widgets: Map<string, string[]>;
+  /** Every widget line shown, in order. */
+  shown: string[];
+}
+
+/** Pi spreads the UI and calls only the methods an extension uses. */
+function isUi(
+  value: Pick<ExtensionUIContext, "setWidget" | "setEditorText">,
+): value is ExtensionUIContext {
+  return "setWidget" in value && "setEditorText" in value;
+}
+
+/** A UI that records the editor text and widgets, the methods pi-compact-assistant uses. */
+function recordingUi(state: UiState): ExtensionUIContext {
+  const ui: Pick<ExtensionUIContext, "notify" | "setWidget" | "getEditorText" | "setEditorText"> = {
+    notify: () => undefined,
+    setWidget: (name: string, content: unknown) => {
+      if (Array.isArray(content)) {
+        state.widgets.set(name, content.map(String));
+        state.shown.push(...content.map(String));
+      } else {
+        state.widgets.delete(name);
+      }
+    },
+    getEditorText: () => state.editorText,
+    setEditorText: (value) => {
+      state.editorText = value;
+    },
+  };
+  assert.ok(isUi(ui));
+  return ui;
 }
 
 /**
@@ -68,6 +107,7 @@ export async function testRuntime(
     refreshOnCreate: false,
   });
   const errors: string[] = [];
+  const ui: UiState = { editorText: "", widgets: new Map(), shown: [] };
   const createRuntime: CreateAgentSessionRuntimeFactory = async (sessionOptions) => {
     const services = await createAgentSessionServices({
       cwd,
@@ -132,6 +172,7 @@ export async function testRuntime(
   });
   const bind = async (session: AgentSession) => {
     await session.bindExtensions({
+      ...(options.ui ? { uiContext: recordingUi(ui) } : {}),
       mode,
       onError: (error) => {
         errors.push(error.error);
@@ -151,7 +192,7 @@ export async function testRuntime(
   runtime.setRebindSession(bind);
   await bind(runtime.session);
   assert.equal(errors.length, 0, errors.join("\n"));
-  return { runtime, faux, errors, cwd, settingsDirectory };
+  return { runtime, faux, errors, cwd, settingsDirectory, ui };
 }
 
 export async function waitUntil(predicate: () => boolean): Promise<void> {

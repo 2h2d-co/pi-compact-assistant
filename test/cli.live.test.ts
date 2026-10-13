@@ -73,6 +73,10 @@ function probes(entries: readonly SessionEntry[]): ProbedInstruction[] {
 function outline(entries: readonly SessionEntry[]): string {
   return entries
     .map((entry) => {
+      if (entry.type === "custom_message" && entry.customType === NOTICE_TYPE) {
+        // The notice is the extension's own text and names why a request stopped.
+        return `${entry.customType}(${JSON.stringify(entry.content).slice(0, 300)})`;
+      }
       if (entry.type === "custom" || entry.type === "custom_message") return entry.customType;
       if (entry.type !== "message") return entry.type;
       const message = entry.message;
@@ -321,9 +325,11 @@ for (const scenario of scenarios) {
       );
       assert.doesNotMatch(client.getStderr(), /Extension error/);
 
-      const records = entries.filter(
-        (entry) => entry.type === "custom" && entry.customType === INSTRUCTION_TYPE,
-      );
+      // The resumed agent may cross a threshold again; check the cycle that ended in compaction.
+      const compactionIndex = entries.findIndex((entry) => entry.type === "compaction");
+      const records = entries
+        .slice(0, compactionIndex)
+        .filter((entry) => entry.type === "custom" && entry.customType === INSTRUCTION_TYPE);
       assert.deepEqual(
         records.map((entry) =>
           entry.type === "custom" &&
@@ -422,20 +428,26 @@ async function settledEntries(
 
 /**
  * Each way an accepted request is cancelled, through the packaged CLI and a real model that the
- * user asks to compact. The fixture or the RPC client interrupts at the point a user would.
+ * user asks to compact. The fixture interrupts at the point a user or extension would.
  */
-const cancellations: { mode: CancelMode; notice: RegExp; compacted: boolean }[] = [
-  { mode: "abort", notice: /did not run: The run was aborted\./, compacted: false },
-  { mode: "branch", notice: /did not run: The session branch changed\./, compacted: false },
-  { mode: "fail", notice: /did not run: Compaction cancelled/, compacted: false },
-  {
-    mode: "input",
-    notice:
-      /ran, but your continuation message was not delivered: User input arrived during compaction\./,
-    compacted: true,
-  },
+const cancellations: { mode: CancelMode; notice: RegExp }[] = [
+  { mode: "abort", notice: /did not run: The run was aborted\./ },
+  { mode: "branch", notice: /did not run: The session branch changed\./ },
+  { mode: "fail", notice: /did not run: Compaction cancelled/ },
 ];
 const cancellationScenario = scenarios[0];
+const COMPACT_PROMPT =
+  "Do not read or write files. Call the compact tool now as your only tool call, with the message: Reply with only the word RESUMED.";
+
+function hasCompactCall(entries: readonly SessionEntry[]): boolean {
+  return entries.some(
+    (entry) =>
+      entry.type === "message" &&
+      entry.message.role === "assistant" &&
+      entry.message.content.some((block) => block.type === "toolCall" && block.name === "compact"),
+  );
+}
+
 for (const cancellation of cancellations) {
   test(
     `live packaged Pi CLI cancels an accepted compact request on ${cancellation.mode}`,
@@ -446,37 +458,14 @@ for (const cancellation of cancellations) {
       const client: RpcClient = new loaded.RpcClient(options);
       t.after(async () => client.stop());
       await client.start();
-      let followUp: Promise<unknown> | undefined;
-      if (cancellation.mode === "input") {
-        // A user follow-up arrives while the compaction runs.
-        client.onEvent((event) => {
-          if (event.type === "compaction_start" && !followUp) {
-            followUp = client.followUp("Reply with only the word READY.");
-          }
-        });
-      }
-      await client.promptAndWait(
-        "Do not read or write files. Call the compact tool now as your only tool call, with the message: Reply with only the word RESUMED.",
-        undefined,
-        240_000,
-      );
+      await client.promptAndWait(COMPACT_PROMPT, undefined, 240_000);
       const entries = await settledEntries(client, (current) =>
         current.some(
           (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
         ),
       );
       assert.doesNotMatch(client.getStderr(), /Extension error|Failed to load extension/);
-      assert.ok(
-        entries.some(
-          (entry) =>
-            entry.type === "message" &&
-            entry.message.role === "assistant" &&
-            entry.message.content.some(
-              (block) => block.type === "toolCall" && block.name === "compact",
-            ),
-        ),
-        `The model called compact. Entries: ${outline(entries)}`,
-      );
+      assert.ok(hasCompactCall(entries), `The model called compact. Entries: ${outline(entries)}`);
       const notice = entries.find(
         (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
       );
@@ -494,11 +483,99 @@ for (const cancellation of cancellations) {
       );
       assert.equal(
         entries.some((entry) => entry.type === "compaction"),
-        cancellation.compacted,
+        false,
       );
-      if (followUp) await followUp;
       t.diagnostic(
-        `Pi ${piVersion} with ${cancellationScenario.compat ?? "no compat extension"}: ${cancellation.mode} cancelled the request with a notice${cancellation.compacted ? " after compaction ran" : ""}.`,
+        `Pi ${piVersion} with ${cancellationScenario.compat ?? "no compat extension"}: ${cancellation.mode} cancelled the request with a notice.`,
+      );
+    },
+  );
+}
+
+/**
+ * User input sent after the model calls `compact` waits for compaction, then follows the
+ * continuation in one turn. The held input conflicts with the continuation, and the user wins.
+ */
+const HELD_INPUT = "Reply with only the word READY.";
+const holds = [
+  { when: "after the call is accepted", event: "tool_execution_end", send: "steer" },
+  { when: "during compaction", event: "compaction_start", send: "followUp" },
+] as const;
+for (const hold of holds) {
+  test(
+    `live packaged Pi CLI holds user input sent ${hold.when} until compaction finishes`,
+    { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
+    async (t) => {
+      assert.ok(cancellationScenario);
+      const { loaded, options } = await prepareLive(t, cancellationScenario);
+      const client: RpcClient = new loaded.RpcClient(options);
+      t.after(async () => client.stop());
+      await client.start();
+      let sent: Promise<unknown> | undefined;
+      client.onEvent((event) => {
+        if (sent || event.type !== hold.event) return;
+        if (event.type === "tool_execution_end" && event.toolName !== "compact") return;
+        sent = hold.send === "steer" ? client.steer(HELD_INPUT) : client.followUp(HELD_INPUT);
+      });
+      await client.promptAndWait(COMPACT_PROMPT, undefined, 240_000);
+      const userIndex = (entries: readonly SessionEntry[]) =>
+        entries.findIndex(
+          (entry) =>
+            entry.type === "message" &&
+            entry.message.role === "user" &&
+            JSON.stringify(entry.message.content).includes(HELD_INPUT),
+        );
+      const entries = await settledEntries(client, (current) => {
+        const index = userIndex(current);
+        return (
+          index >= 0 &&
+          current
+            .slice(index + 1)
+            .some(
+              (entry) =>
+                entry.type === "message" &&
+                entry.message.role === "assistant" &&
+                entry.message.stopReason === "stop",
+            )
+        );
+      });
+      assert.doesNotMatch(client.getStderr(), /Extension error|Failed to load extension/);
+      assert.equal(await sent, "handled", "Pi reports the input as handled, not queued.");
+      assert.ok(hasCompactCall(entries), `The model called compact. Entries: ${outline(entries)}`);
+      assert.equal(
+        entries.some(
+          (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
+        ),
+        false,
+        `No cancellation notice. Entries: ${outline(entries)}`,
+      );
+      const compaction = entries.findIndex((entry) => entry.type === "compaction");
+      const continuation = entries.findIndex(
+        (entry) => entry.type === "custom_message" && entry.customType === CONTINUATION_TYPE,
+      );
+      const input = userIndex(entries);
+      assert.ok(
+        compaction >= 0 && compaction < continuation && continuation < input,
+        `Compaction, then the continuation, then the held input. Entries: ${outline(entries)}`,
+      );
+      const call = entries.findLastIndex(
+        (entry, index) => index < compaction && entry.type === "message",
+      );
+      const beforeCompaction = entries[call];
+      assert.ok(
+        beforeCompaction?.type === "message" && beforeCompaction.message.role === "toolResult",
+        `The model did not answer the input before compaction. Entries: ${outline(entries)}`,
+      );
+      const reply = entries
+        .slice(input + 1)
+        .findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
+      assert.ok(reply?.type === "message" && reply.message.role === "assistant");
+      const replyText = reply.message.content
+        .map((block) => (block.type === "text" ? block.text : ""))
+        .join("");
+      assert.match(replyText, /READY/, "The user's newer input wins over the continuation.");
+      t.diagnostic(
+        `Pi ${piVersion} with ${cancellationScenario.compat ?? "no compat extension"}: input sent ${hold.when} was held and answered after compaction: ${JSON.stringify(replyText.slice(0, 80))}.`,
       );
     },
   );

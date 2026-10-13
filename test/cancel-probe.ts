@@ -1,11 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export const CANCEL_MODE_ENV = "PI_COMPACT_ASSISTANT_LIVE_CANCEL";
-export type CancelMode = "abort" | "branch" | "fail" | "input";
+export type CancelMode = "abort" | "branch" | "fail";
 
 /**
  * Live-test fixture that interrupts an accepted `compact` request the way a user or another
- * extension would. The live test sends the `input` mode's follow-up itself over RPC.
+ * extension would.
  *
  * - `abort` aborts the run after `compact` returns, like pressing Escape.
  * - `branch` moves the session leaf back to the user prompt before compaction starts, like a
