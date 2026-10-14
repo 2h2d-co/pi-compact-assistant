@@ -507,10 +507,6 @@ async function interruptedRequest(
       order: entries
         .slice(entries.findIndex((entry) => label(entry) === "assistant:") + 1)
         .flatMap((entry) => label(entry) ?? []),
-      compacted: session()
-        .sessionManager.getEntries()
-        .some((entry) => entry.type === "compaction"),
-      continued: custom(CONTINUATION_TYPE).length > 0,
       shown: runtime.ui.shown,
       heldWidget: runtime.ui.widgets.get(HELD_WIDGET),
     };
@@ -626,23 +622,19 @@ test("held input follows the notice of a failed compaction", async () => {
   assert.equal(result.order.at(-1), "assistant:READY");
 });
 
-test("a branch change before compaction cancels the request", async () => {
-  const result = await interruptedRequest((pi, session) => {
-    let navigated = false;
-    pi.on("agent_settled", async () => {
-      if (navigated) return;
-      const prompt = session()
-        .sessionManager.getBranch()
-        .findLast((entry) => entry.type === "message" && entry.message.role === "user");
-      if (!prompt || !JSON.stringify(prompt).includes("compact now")) return;
-      navigated = true;
-      await session().navigateTree(prompt.id, { summarize: false });
+test("the extension adds no command to the command menu", async () => {
+  let commands: string[] = [];
+  const { runtime, errors } = await testRuntime(SETTINGS, (pi) => {
+    pi.on("session_start", () => {
+      commands = pi.getCommands().map((command) => command.name);
     });
   });
-  assert.equal(result.notices.length, 1);
-  assert.match(result.notices[0] ?? "", /did not run: The session branch changed\./);
-  assert.equal(result.compacted, false);
-  assert.equal(result.continued, false);
+  try {
+    assert.deepEqual(commands, []);
+    assert.deepEqual(errors, []);
+  } finally {
+    await runtime.dispose();
+  }
 });
 
 test("models set to false and invalid settings leave requests unchanged", async () => {

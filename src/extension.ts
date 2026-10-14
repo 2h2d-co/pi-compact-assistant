@@ -23,7 +23,6 @@ import { findCodexCompatProblem, unsupportedReason } from "./support.ts";
 export const INSTRUCTION_TYPE = "pi-compact-assistant:instruction";
 export const CONTINUATION_TYPE = "pi-compact-assistant:continuation";
 export const NOTICE_TYPE = "pi-compact-assistant:notice";
-export const APPLY_COMMAND = "compact-assistant-apply";
 export const HELD_WIDGET = "pi-compact-assistant:held";
 
 type ContextMessage = ContextWithSystemEvent["messages"][number];
@@ -51,8 +50,6 @@ interface Request {
   id: string;
   message: string;
   instructions: string | undefined;
-  assistantId: string;
-  epoch: number;
   dispatched: boolean;
   held: HeldInput[];
 }
@@ -182,7 +179,7 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : "Compaction failed.";
 }
 
-function assertSoleCall(ctx: ExtensionContext, toolCallId: string): string {
+function assertSoleCall(ctx: ExtensionContext, toolCallId: string): void {
   const entry = ctx.sessionManager
     .getBranch()
     .findLast(
@@ -197,7 +194,6 @@ function assertSoleCall(ctx: ExtensionContext, toolCallId: string): string {
       `Call ${COMPACT_TOOL_NAME} alone, after every other tool call has returned. Nothing was compacted.`,
     );
   }
-  return entry.id;
 }
 
 export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOptions = {}): void {
@@ -206,7 +202,6 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
   let settings: Settings | undefined;
   let codexCompatProblem: string | undefined;
   let pending: Request | undefined;
-  let epoch = 0;
   const reported = new Set<string>();
 
   function report(ctx: ExtensionContext, key: string, message: string): void {
@@ -234,12 +229,6 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     } else if (!shown) {
       pi.setActiveTools([...active, COMPACT_TOOL_NAME]);
     }
-  }
-
-  function assertCurrent(request: Request, ctx: ExtensionContext): void {
-    const branch = ctx.sessionManager.getBranch();
-    const start = branch.findIndex((entry) => entry.id === request.assistantId);
-    if (start < 0 || epoch !== request.epoch) throw new Error("The session branch changed.");
   }
 
   function showHeld(request: Request, ctx: ExtensionContext): void {
@@ -302,10 +291,8 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
   });
   pi.on("session_shutdown", () => {
     pending = undefined;
-    epoch++;
   });
   pi.on("session_tree", (_event, ctx) => {
-    epoch++;
     // Pi restores the tool loadout the branch declared, which may predate a model switch.
     showTool(ctx.model);
   });
@@ -386,7 +373,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     return { messages: injectInstructions(event.messages, records, projection) };
   });
 
-  pi.on("agent_settled", (event, ctx) => {
+  pi.on("agent_settled", async (event, ctx) => {
     const request = pending;
     if (!request || request.dispatched) return;
     if (event.aborted) {
@@ -394,63 +381,45 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       return;
     }
     if (!ctx.isIdle()) return;
-    const commands = pi
-      .getCommands()
-      .filter(
-        (command) => command.name === APPLY_COMMAND || command.name.startsWith(`${APPLY_COMMAND}:`),
-      );
-    const command = commands.length === 1 ? commands[0] : undefined;
-    if (!command) {
-      stop(request, ctx, new Error("The internal compaction command is unavailable."));
-      return;
-    }
     request.dispatched = true;
-    // Pi defers prompts sent from settled handlers until every handler returns, and idle
-    // waits include the command, so print and JSON hosts do not exit before it finishes.
-    // Awaiting it here would wait for work that cannot start yet.
-    pi.sendUserMessage(`/${command.name} ${request.id}`, { expandPromptTemplates: true });
+    const compaction = compact(request, ctx);
+    // Print and JSON hosts exit once the prompt settles, so they wait here. Pi defers the
+    // continuation sent from this handler and runs it before the prompt returns. A UI host does
+    // not wait: Pi would also defer the input its editor queued during compaction, and that input
+    // would run as its own turn before the continuation.
+    if (!ctx.hasUI) await compaction;
   });
 
-  pi.registerCommand(APPLY_COMMAND, {
-    description: `Internal command that runs an accepted ${COMPACT_TOOL_NAME} request.`,
-    async handler(args, ctx) {
-      const request = pending;
-      if (!request || request.id !== args.trim()) {
-        ctx.ui.notify("No matching compaction request. Requests are never replayed.", "warning");
-        return;
-      }
-      try {
-        await ctx.waitForIdle();
-        assertCurrent(request, ctx);
-        await new Promise<void>((resolve, reject) => {
-          ctx.compact({
-            ...(request.instructions ? { customInstructions: request.instructions } : {}),
-            onComplete: () => {
-              resolve();
-            },
-            onError: reject,
-          });
+  /** Compact, then send the continuation. Failures cancel the request with a notice. */
+  async function compact(request: Request, ctx: ExtensionContext): Promise<void> {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        ctx.compact({
+          ...(request.instructions ? { customInstructions: request.instructions } : {}),
+          onComplete: () => {
+            resolve();
+          },
+          onError: reject,
         });
-      } catch (error) {
-        stop(request, ctx, error);
-        return;
-      }
-      pending = undefined;
-      // The continuation starts the next turn, or steers a run another extension started.
-      // Queued and held messages follow it as separate messages.
-      pi.sendMessage(
-        {
-          customType: CONTINUATION_TYPE,
-          content: continuationText(request.message),
-          display: true,
-          details: { requestId: request.id },
-        },
-        { triggerTurn: true, deliverAs: "steer" },
-      );
-      releaseHeld(request, ctx);
-      await ctx.waitForIdle();
-    },
-  });
+      });
+    } catch (error) {
+      stop(request, ctx, error);
+      return;
+    }
+    pending = undefined;
+    // The continuation starts the next turn, or steers a run another extension started.
+    // Queued and held messages follow it as separate messages.
+    pi.sendMessage(
+      {
+        customType: CONTINUATION_TYPE,
+        content: continuationText(request.message),
+        display: true,
+        details: { requestId: request.id },
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+    releaseHeld(request, ctx);
+  }
 
   pi.registerTool({
     name: COMPACT_TOOL_NAME,
@@ -478,13 +447,11 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       if (!input.message.trim()) throw new Error("message must not be empty.");
       if (pending)
         throw new Error("A compaction request is already pending. It runs when this run ends.");
-      const assistantId = assertSoleCall(ctx, toolCallId);
+      assertSoleCall(ctx, toolCallId);
       const request: Request = {
         id: randomUUID(),
         message: input.message,
         instructions: input.instructions?.trim() || undefined,
-        assistantId,
-        epoch,
         dispatched: false,
         held: [],
       };

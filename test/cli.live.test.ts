@@ -190,7 +190,6 @@ async function prepareLive(t: TestContext, scenario: Scenario, cancel?: CancelMo
       "low",
       "--session",
       join(temporary, "session.jsonl"),
-      // The branch fixture must load first so its settled handler dispatches first.
       ...(cancel ? ["-e", join(root, "test/cancel-probe.ts")] : []),
       "-e",
       packageRoot,
@@ -434,7 +433,6 @@ async function settledEntries(
  */
 const cancellations: { mode: CancelMode; notice: RegExp }[] = [
   { mode: "abort", notice: /did not run: The run was aborted\./ },
-  { mode: "branch", notice: /did not run: The session branch changed\./ },
   { mode: "fail", notice: /did not run: Compaction cancelled/ },
 ];
 const cancellationScenario = scenarios[0];

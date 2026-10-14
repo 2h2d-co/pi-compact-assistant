@@ -156,10 +156,16 @@ at the user's request.
   select or emphasize conversation content. Anthropic's native compaction refused an instruction
   to state a fact that was not in the conversation, and a refusal cancels the compaction.
 
-The model must call `compact` alone. The tool ends the tool batch. After the agent run settles,
+The model must call `compact` alone. The tool ends the tool batch. When the agent run settles,
 the extension compacts the session, then sends the message as an agent-authored continuation,
 which starts the next turn. The continuation states that it is not a new user request or
-authorization.
+authorization. Print and JSON runs wait for the compaction and the continuation before they
+exit. The extension adds no command.
+
+Compaction starts in the extension's `agent_settled` handler. In interactive and RPC sessions,
+work that another extension sends from its own `agent_settled` handler arrives while compaction
+runs. Pi refuses a user message from it, and a custom message that triggers a turn starts a run
+during compaction.
 
 Queued messages never cancel the request:
 
@@ -173,8 +179,7 @@ Queued messages never cancel the request:
 
 The request is cancelled, and the model is told, when:
 
-- the run is aborted;
-- the session branch changes before compaction starts; or
+- the run is aborted; or
 - compaction fails or another extension cancels it.
 
 After a cancellation, held input follows the notice as separate messages.

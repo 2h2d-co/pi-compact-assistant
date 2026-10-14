@@ -27,8 +27,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   agent. Queued messages never cancel the request: messages queued before the run ends reach the
   model before compaction, and user input that arrives later waits until compaction finishes.
   After compaction, the continuation comes first and every other message follows it as a
-  separate message. An aborted run, a branch change, or a failed compaction cancels the request
-  with a notice, and held input follows the notice.
+  separate message. An aborted run or a failed compaction cancels the request with a notice, and
+  held input follows the notice. The extension adds no command.
   The tool is declared only to supported models that the settings enable.
 - Read token or percentage thresholds from `~/.pi/agent/pi-compact-assistant.json`, with exact
   `provider/modelId` entries and a default for other models. `prepareAt` is optional; without
