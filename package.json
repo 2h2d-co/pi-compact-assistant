@@ -1,6 +1,6 @@
 {
   "name": "pi-compact-assistant",
-  "version": "0.0.1-alpha.5",
+  "version": "0.0.1-alpha.6",
   "description": "Context-threshold compaction guidance and a model-callable compact tool for Pi",
   "keywords": [
     "pi-package"
