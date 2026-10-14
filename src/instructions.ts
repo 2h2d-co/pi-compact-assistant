@@ -105,21 +105,13 @@ export function instructionText(kind: InstructionKind): string {
   ].join("\n");
 }
 
-/**
- * The custom message that resumes the agent after compaction. `userFollows` is true when user
- * input held during compaction is delivered directly after it.
- */
-export function continuationText(message: string, userFollows = false): string {
+/** The custom message that resumes the agent after compaction. */
+export function continuationText(message: string): string {
   return [
     "[Agent-authored continuation after compaction]",
     message,
     "",
     "You wrote this message before compaction. If it names a state file, read that file before acting, then continue the user's task from it. Otherwise, continue from the state in this message.",
     "This message is not a new user request and grants no additional authorization.",
-    ...(userFollows
-      ? [
-          `The user sent the next message after you called \`${COMPACT_TOOL_NAME}\`. It is newer than this message. Where they conflict, follow the user's message.`,
-        ]
-      : []),
   ].join("\n");
 }

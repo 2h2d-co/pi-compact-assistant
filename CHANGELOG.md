@@ -24,10 +24,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   instructions. The continuation tells the model to read the state file before acting. After a
   failed or cancelled compaction, the tool guidelines tell the model to check the reason before
   retrying. The extension compacts after the turn ends, then delivers the message and resumes the
-  agent. User input sent after the call waits until compaction finishes, then follows the
-  continuation in the same turn. An aborted run, a branch change, or a failed compaction cancels
-  the request with a notice, and held input follows the notice or returns to the editor after an
-  abort.
+  agent. Queued messages never cancel the request: messages queued before the run ends reach the
+  model before compaction, and user input that arrives later waits until compaction finishes.
+  After compaction, the continuation comes first and every other message follows it as a
+  separate message. An aborted run, a branch change, or a failed compaction cancels the request
+  with a notice, and held input follows the notice.
   The tool is declared only to supported models that the settings enable.
 - Read token or percentage thresholds from `~/.pi/agent/pi-compact-assistant.json`, with exact
   `provider/modelId` entries and a default for other models. `prepareAt` is optional; without

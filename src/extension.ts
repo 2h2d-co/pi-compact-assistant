@@ -240,18 +240,6 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     const branch = ctx.sessionManager.getBranch();
     const start = branch.findIndex((entry) => entry.id === request.assistantId);
     if (start < 0 || epoch !== request.epoch) throw new Error("The session branch changed.");
-    if (ctx.hasPendingMessages()) throw new Error("Queued input must be handled first.");
-    if (
-      branch
-        .slice(start + 1)
-        .some(
-          (entry) =>
-            entry.type === "message" &&
-            (entry.message.role === "user" || entry.message.role === "assistant"),
-        )
-    ) {
-      throw new Error("The conversation advanced after the request.");
-    }
   }
 
   function showHeld(request: Request, ctx: ExtensionContext): void {
@@ -265,49 +253,38 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
   }
 
   /**
-   * Deliver held user input as one user message, or return it to the editor after an abort, as
-   * Pi does with its own queues. Without a UI, input held during an aborted run is dropped.
+   * Deliver each held input as its own user message. Call it after the continuation or notice is
+   * sent, so the held messages follow it in Pi's steering queue.
    */
-  function releaseHeld(request: Request, ctx: ExtensionContext, restore: boolean): void {
+  function releaseHeld(request: Request, ctx: ExtensionContext): void {
     const held = request.held.splice(0);
     showHeld(request, ctx);
-    if (held.length === 0) return;
-    const text = held.map((input) => input.text).join("\n\n");
-    if (restore) {
-      if (!ctx.hasUI) return;
-      const current = ctx.ui.getEditorText();
-      ctx.ui.setEditorText([text, current].filter((part) => part.trim()).join("\n\n"));
-      return;
+    for (const input of held) {
+      pi.sendUserMessage(
+        input.images.length > 0
+          ? [{ type: "text", text: input.text }, ...input.images]
+          : input.text,
+        { deliverAs: "steer", expandPromptTemplates: true },
+      );
     }
-    const images = held.flatMap((input) => input.images);
-    pi.sendUserMessage(images.length > 0 ? [{ type: "text", text }, ...images] : text, {
-      deliverAs: "followUp",
-      // Pi expands a prompt template or skill command only at the start of a message.
-      expandPromptTemplates: held.length === 1,
-    });
   }
 
-  function stop(
-    request: Request,
-    ctx: ExtensionContext,
-    error: unknown,
-    { compacted = false, aborted = false } = {},
-  ): void {
+  function stop(request: Request, ctx: ExtensionContext, error: unknown): void {
     if (pending === request) pending = undefined;
     const reason = errorText(error);
     pi.sendMessage(
       {
         customType: NOTICE_TYPE,
-        content: compacted
-          ? `Compaction requested with ${COMPACT_TOOL_NAME} ran, but your continuation message was not delivered: ${reason} Continue from the conversation and the newer input.`
-          : `Compaction requested with ${COMPACT_TOOL_NAME} did not run: ${reason} Nothing was retried. Your continuation message was not delivered.`,
+        content: `Compaction requested with ${COMPACT_TOOL_NAME} did not run: ${reason} Nothing was retried. Your continuation message was not delivered.`,
         display: true,
         details: { requestId: request.id },
       },
-      { triggerTurn: false },
+      // With held input the notice starts the next turn and the input follows it. Otherwise the
+      // notice waits for the next prompt.
+      { triggerTurn: request.held.length > 0, deliverAs: "steer" },
     );
     if (ctx.hasUI) ctx.ui.notify(`Compaction stopped: ${reason}`, "error");
-    releaseHeld(request, ctx, aborted);
+    releaseHeld(request, ctx);
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -335,11 +312,12 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
   pi.on("model_select", (event) => {
     showTool(event.model);
   });
-  // User input after an accepted request waits until compaction finishes, then follows the
-  // continuation. Input from extensions is not held.
+  // Input that arrives after the run ends would start a run before the continuation, so it
+  // waits until compaction finishes, then follows the continuation. Input during the run reaches
+  // the model as usual, before compaction.
   pi.on("input", (event, ctx) => {
     const request = pending;
-    if (!request || event.source === "extension") return undefined;
+    if (!request?.dispatched) return undefined;
     request.held.push({ text: event.text, images: event.images ?? [] });
     showHeld(request, ctx);
     return { action: "handled" as const };
@@ -412,7 +390,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     const request = pending;
     if (!request || request.dispatched) return;
     if (event.aborted) {
-      stop(request, ctx, new Error("The run was aborted."), { aborted: true });
+      stop(request, ctx, new Error("The run was aborted."));
       return;
     }
     if (!ctx.isIdle()) return;
@@ -457,25 +435,19 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
         stop(request, ctx, error);
         return;
       }
-      if (epoch !== request.epoch || ctx.hasPendingMessages() || !ctx.isIdle()) {
-        stop(request, ctx, new Error("Other input arrived during compaction."), {
-          compacted: true,
-        });
-        return;
-      }
       pending = undefined;
-      const userFollows = request.held.length > 0;
-      // With held input, the continuation is appended first and the user's message starts the turn.
+      // The continuation starts the next turn, or steers a run another extension started.
+      // Queued and held messages follow it as separate messages.
       pi.sendMessage(
         {
           customType: CONTINUATION_TYPE,
-          content: continuationText(request.message, userFollows),
+          content: continuationText(request.message),
           display: true,
           details: { requestId: request.id },
         },
-        { triggerTurn: !userFollows },
+        { triggerTurn: true, deliverAs: "steer" },
       );
-      releaseHeld(request, ctx, false);
+      releaseHeld(request, ctx);
       await ctx.waitForIdle();
     },
   });
@@ -484,7 +456,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     name: COMPACT_TOOL_NAME,
     label: "Compact context",
     description:
-      "Compact the conversation, then continue from your message. Call this tool when a `[Compaction required]` instruction asks for it or when the user asks you to compact. First record the state in a Markdown state file. Then call this tool as the only tool call in its response. The call ends your current turn. Compaction runs next. If it succeeds, your message is delivered and starts your next turn. The tool result only confirms that the request was accepted.",
+      "Compact the conversation, then continue from your message. Call this tool when a `[Compaction required]` instruction asks for it or when the user asks you to compact. First record the state in a Markdown state file. Then call this tool as the only tool call in its response. The call ends your current turn. Compaction runs when the agent run ends. Messages that arrive before then are delivered to you first. After compaction succeeds, your message is delivered and starts your next turn. The tool result only confirms that the request was accepted.",
     promptSnippet: "Compact the conversation and continue from a Markdown state file",
     promptGuidelines: [
       `Call ${COMPACT_TOOL_NAME} only when a \`[Compaction required]\` instruction asks for it or when the user asks you to compact. Make it the only tool call in its response.`,
@@ -504,10 +476,8 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     execute(toolCallId, input: CompactInput, _signal, _update, ctx) {
       Value.Assert(compactSchema, input);
       if (!input.message.trim()) throw new Error("message must not be empty.");
-      if (pending) throw new Error("A compaction request is already pending.");
-      if (ctx.hasPendingMessages()) {
-        throw new Error("Handle queued user input before compacting. Nothing was compacted.");
-      }
+      if (pending)
+        throw new Error("A compaction request is already pending. It runs when this run ends.");
       const assistantId = assertSoleCall(ctx, toolCallId);
       const request: Request = {
         id: randomUUID(),
@@ -523,7 +493,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
         content: [
           {
             type: "text" as const,
-            text: "Compaction accepted. It runs after this turn ends. Your message is delivered after it succeeds.",
+            text: "Compaction accepted. It runs when this run ends. If messages arrive first, handle them as usual and keep the state file current. Your message is delivered after compaction succeeds.",
           },
         ],
         details: { requestId: request.id, phase: "accepted" },

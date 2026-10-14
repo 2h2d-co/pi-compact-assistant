@@ -156,27 +156,28 @@ at the user's request.
   select or emphasize conversation content. Anthropic's native compaction refused an instruction
   to state a fact that was not in the conversation, and a refusal cancels the compaction.
 
-The model must call `compact` alone. The tool ends the tool batch. After the run settles, the
-extension compacts the session, appends the message as an agent-authored continuation, and
-resumes the agent. The continuation states that it is not a new user request or authorization.
+The model must call `compact` alone. The tool ends the tool batch. After the agent run settles,
+the extension compacts the session, then sends the message as an agent-authored continuation,
+which starts the next turn. The continuation states that it is not a new user request or
+authorization.
 
-User input sent after `compact` accepts the request waits until compaction finishes. This covers
-steering and follow-up messages sent while the run ends and input sent while compaction runs.
-Interactive sessions list the held messages above the editor. After compaction, the continuation
-is appended and the held input follows as one user message, which starts the next turn. The
-continuation tells the model that the user's message is newer and wins where they conflict.
-Input queued before `compact` runs still makes the tool refuse the request.
+Queued messages never cancel the request:
+
+- Messages queued before the run ends, from the user or another extension, reach the model as
+  usual before compaction. The tool result tells the model to handle them and keep the state file
+  current.
+- User input that arrives after the run ends waits until compaction finishes. Interactive sessions
+  list it above the editor. Pi refuses prompts from other extensions while compaction runs.
+- After compaction, the continuation comes first. Held input and messages still in Pi's queue
+  follow it as separate messages, delivered by Pi's `steeringMode` and `followUpMode` settings.
 
 The request is cancelled, and the model is told, when:
 
 - the run is aborted;
-- the session branch changes or the conversation advances before compaction starts; or
+- the session branch changes before compaction starts; or
 - compaction fails or another extension cancels it.
 
-After a cancellation, held input is delivered after the notice. After an aborted run, it returns
-to the editor instead, as Pi does with its own queued messages. If an extension adds input while
-compaction runs, the compaction completes but the continuation is withheld, and the notice says
-so.
+After a cancellation, held input follows the notice as separate messages.
 
 Cancelled requests are never retried or replayed. `compact` changes conversation context only,
 never files, processes, or permissions.
@@ -211,8 +212,9 @@ the provider's compat extension, and checks that both instructions reach the pro
 model calls `compact`, compaction runs, and the agent resumes with earlier facts intact. Further
 scenarios ask the model to compact, then abort the run, change the session branch, or cancel the
 compaction, and check that the continuation is withheld with a notice. Two more send user input
-after the call and during compaction, and check that the input waits for compaction and follows
-the continuation. Another checks that the provider payload declares `compact` to an enabled
+while the model calls `compact` and during compaction. They check that compaction still runs,
+that the first input reaches the model before compaction, and that the second follows the
+continuation as its own message. Another checks that the provider payload declares `compact` to an enabled
 model and removes it once the model is disabled. Release validation runs it against the exact release archive.
 
 ## Packaging

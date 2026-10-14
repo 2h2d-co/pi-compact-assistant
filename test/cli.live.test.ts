@@ -495,17 +495,26 @@ for (const cancellation of cancellations) {
 }
 
 /**
- * User input sent after the model calls `compact` waits for compaction, then follows the
- * continuation in one turn. The held input conflicts with the continuation, and the user wins.
+ * User input sent after the model calls `compact` never cancels it. Input during the run reaches
+ * the model before compaction. Input during compaction waits and follows the continuation as its
+ * own message.
  */
-const HELD_INPUT = "Reply with only the word READY.";
+// The input does not conflict with the continuation, so the model can follow both.
+const HELD_INPUT = "Include the word READY in your next reply.";
 const holds = [
-  { when: "after the call is accepted", event: "tool_execution_end", send: "steer" },
-  { when: "during compaction", event: "compaction_start", send: "followUp" },
+  // Sent while the model writes its compact call, so the input is queued before the tool runs.
+  { when: "while the model calls compact", event: "message_start", send: "steer", held: false },
+  { when: "during compaction", event: "compaction_start", send: "followUp", held: true },
 ] as const;
+
+function assistantText(entry: SessionEntry | undefined): string | undefined {
+  if (entry?.type !== "message" || entry.message.role !== "assistant") return undefined;
+  return entry.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+}
+
 for (const hold of holds) {
   test(
-    `live packaged Pi CLI holds user input sent ${hold.when} until compaction finishes`,
+    `live packaged Pi CLI delivers user input sent ${hold.when} and still compacts`,
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
     async (t) => {
       assert.ok(cancellationScenario);
@@ -516,7 +525,7 @@ for (const hold of holds) {
       let sent: Promise<unknown> | undefined;
       client.onEvent((event) => {
         if (sent || event.type !== hold.event) return;
-        if (event.type === "tool_execution_end" && event.toolName !== "compact") return;
+        if (event.type === "message_start" && event.message.role !== "assistant") return;
         sent = hold.send === "steer" ? client.steer(HELD_INPUT) : client.followUp(HELD_INPUT);
       });
       await client.promptAndWait(COMPACT_PROMPT, undefined, 240_000);
@@ -527,22 +536,28 @@ for (const hold of holds) {
             entry.message.role === "user" &&
             JSON.stringify(entry.message.content).includes(HELD_INPUT),
         );
-      const entries = await settledEntries(client, (current) => {
-        const index = userIndex(current);
-        return (
-          index >= 0 &&
-          current
-            .slice(index + 1)
-            .some(
-              (entry) =>
-                entry.type === "message" &&
-                entry.message.role === "assistant" &&
-                entry.message.stopReason === "stop",
-            )
+      const continuationIndex = (entries: readonly SessionEntry[]) =>
+        entries.findIndex(
+          (entry) => entry.type === "custom_message" && entry.customType === CONTINUATION_TYPE,
         );
-      });
+      const answeredAfter = (entries: readonly SessionEntry[], index: number) =>
+        index >= 0 &&
+        entries
+          .slice(index + 1)
+          .some(
+            (entry) =>
+              entry.type === "message" &&
+              entry.message.role === "assistant" &&
+              entry.message.stopReason === "stop",
+          );
+      const entries = await settledEntries(
+        client,
+        (current) =>
+          answeredAfter(current, userIndex(current)) &&
+          answeredAfter(current, continuationIndex(current)),
+      );
       assert.doesNotMatch(client.getStderr(), /Extension error|Failed to load extension/);
-      assert.equal(await sent, "handled", "Pi reports the input as handled, not queued.");
+      assert.equal(await sent, hold.held ? "handled" : "queued");
       assert.ok(hasCompactCall(entries), `The model called compact. Entries: ${outline(entries)}`);
       assert.equal(
         entries.some(
@@ -552,32 +567,25 @@ for (const hold of holds) {
         `No cancellation notice. Entries: ${outline(entries)}`,
       );
       const compaction = entries.findIndex((entry) => entry.type === "compaction");
-      const continuation = entries.findIndex(
-        (entry) => entry.type === "custom_message" && entry.customType === CONTINUATION_TYPE,
-      );
+      const continuation = continuationIndex(entries);
       const input = userIndex(entries);
       assert.ok(
-        compaction >= 0 && compaction < continuation && continuation < input,
-        `Compaction, then the continuation, then the held input. Entries: ${outline(entries)}`,
+        compaction >= 0 && compaction < continuation,
+        `Compaction, then the continuation. Entries: ${outline(entries)}`,
       );
-      const call = entries.findLastIndex(
-        (entry, index) => index < compaction && entry.type === "message",
-      );
-      const beforeCompaction = entries[call];
-      assert.ok(
-        beforeCompaction?.type === "message" && beforeCompaction.message.role === "toolResult",
-        `The model did not answer the input before compaction. Entries: ${outline(entries)}`,
-      );
+      if (hold.held) {
+        assert.ok(continuation < input, `The input follows the continuation: ${outline(entries)}`);
+      } else {
+        assert.ok(input < compaction, `The input reaches the model first: ${outline(entries)}`);
+      }
+      // The reply to the input comes before the next user or custom message.
       const reply = entries
         .slice(input + 1)
-        .findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
-      assert.ok(reply?.type === "message" && reply.message.role === "assistant");
-      const replyText = reply.message.content
-        .map((block) => (block.type === "text" ? block.text : ""))
-        .join("");
-      assert.match(replyText, /READY/, "The user's newer input wins over the continuation.");
+        .find((entry) => entry.type === "message" && entry.message.role === "assistant");
+      const replyText = assistantText(reply) ?? "";
+      assert.match(replyText, /READY/, "The model answers the input.");
       t.diagnostic(
-        `Pi ${piVersion} with ${cancellationScenario.compat ?? "no compat extension"}: input sent ${hold.when} was held and answered after compaction: ${JSON.stringify(replyText.slice(0, 80))}.`,
+        `Pi ${piVersion} with ${cancellationScenario.compat ?? "no compat extension"}: input sent ${hold.when} was ${hold.held ? "held until after compaction" : "answered before compaction"}: ${JSON.stringify(replyText.slice(0, 80))}.`,
       );
     },
   );

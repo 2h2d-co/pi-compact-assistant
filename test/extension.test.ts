@@ -11,7 +11,7 @@ import {
   type FauxResponseFactory,
   type Message,
 } from "@earendil-works/pi-ai";
-import type { AgentSession, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ExtensionFactory, SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
   CONTINUATION_TYPE,
   HELD_WIDGET,
@@ -440,22 +440,25 @@ test("an aborted run cancels the accepted request and tells the model", async ()
 
 const HELD = "newer input";
 
-/** Whether a model request ends with the held user input or the continuation. */
-function answersHeldInput(messages: readonly Message[]): boolean {
-  const last = messages.at(-1);
-  return (
-    last !== undefined &&
-    (text(last) === HELD || text(last).includes("Agent-authored continuation after compaction"))
-  );
+/** A user message's text, or a custom message's type, for checking session order. */
+function label(entry: SessionEntry): string | undefined {
+  if (entry.type === "compaction") return "compaction";
+  if (entry.type === "custom_message") return entry.customType;
+  if (entry.type === "message" && entry.message.role === "user")
+    return `user:${text(entry.message)}`;
+  if (entry.type === "message" && entry.message.role === "assistant") {
+    return `assistant:${text(entry.message)}`;
+  }
+  return undefined;
 }
 
 /**
- * Notices, branch shape, and the model's last request after a user-requested compact call that
- * `interrupt` disturbs. The model answers `READY` to held input or a continuation.
+ * The session order and notices after a user-requested compact call that `interrupt` disturbs.
+ * The model answers `READY` to every request except summaries.
  */
 async function interruptedRequest(
   interrupt: (pi: Parameters<ExtensionFactory>[0], session: () => AgentSession) => void,
-  { ui = false } = {},
+  { ui = false, settle = "notice" }: { ui?: boolean; settle?: "notice" | "continuation" } = {},
 ) {
   let current: (() => AgentSession) | undefined;
   // A threshold the test never reaches keeps compact declared without instructions.
@@ -477,17 +480,14 @@ async function interruptedRequest(
   try {
     faux.setResponses([fauxAssistantMessage("ok")]);
     await session().prompt(`earlier request ${filler(21000)}`);
-    let answered: Message[] | undefined;
     const respond: FauxResponseFactory = (context) => {
-      if (!answersHeldInput(context.messages)) {
-        return fauxAssistantMessage("Summary: the earlier request was handled.");
-      }
-      answered = context.messages;
-      return fauxAssistantMessage("READY");
+      faux.appendResponses([respond]);
+      return getCurrentSystemPrompt(context.messages).includes(SYSTEM_INSTRUCTIONS)
+        ? fauxAssistantMessage("READY")
+        : fauxAssistantMessage("Summary: the earlier request was handled.");
     };
     faux.setResponses([
       fauxAssistantMessage(fauxToolCall("compact", { message: "Continue" })),
-      respond,
       respond,
     ]);
     await session().prompt(`compact now ${filler(300)}`);
@@ -495,38 +495,28 @@ async function interruptedRequest(
       session()
         .sessionManager.getEntries()
         .filter((entry) => entry.type === "custom_message" && entry.customType === type);
-    await waitUntil(
-      () => answered !== undefined || (custom(NOTICE_TYPE).length > 0 && session().isIdle),
-    );
+    await waitUntil(() => custom(settle === "notice" ? NOTICE_TYPE : CONTINUATION_TYPE).length > 0);
     await session().waitForIdle();
-    const entries = session().sessionManager.getEntries();
+    const entries = session().sessionManager.getBranch();
     assert.deepEqual(errors, []);
     return {
       notices: custom(NOTICE_TYPE).map((entry) =>
         JSON.stringify(entry.type === "custom_message" && entry.content),
       ),
-      compacted: entries.some((entry) => entry.type === "compaction"),
+      /** Compactions, custom messages, user messages, and replies after the compact call. */
+      order: entries
+        .slice(entries.findIndex((entry) => label(entry) === "assistant:") + 1)
+        .flatMap((entry) => label(entry) ?? []),
+      compacted: session()
+        .sessionManager.getEntries()
+        .some((entry) => entry.type === "compaction"),
       continued: custom(CONTINUATION_TYPE).length > 0,
-      /** The request that answered held input or the continuation. */
-      answered: answered?.map((message) => ({ role: message.role, text: text(message) })),
-      /** Assistant texts in session order. */
-      replies: entries.flatMap((entry) =>
-        entry.type === "message" && entry.message.role === "assistant" ? [text(entry.message)] : [],
-      ),
-      heldWidget: runtime.ui.widgets.get(HELD_WIDGET),
       shown: runtime.ui.shown,
-      editorText: runtime.ui.editorText,
+      heldWidget: runtime.ui.widgets.get(HELD_WIDGET),
     };
   } finally {
     await runtime.runtime.dispose();
   }
-}
-
-/** Hold user input right after the compact tool accepts the request. */
-function steerAfterAccept(pi: Parameters<ExtensionFactory>[0], session: () => AgentSession) {
-  pi.on("tool_execution_end", async (event) => {
-    if (event.toolName === "compact") await session().steer(HELD);
-  });
 }
 
 test("a failed compaction cancels the request and tells the model", async () => {
@@ -535,69 +525,105 @@ test("a failed compaction cancels the request and tells the model", async () => 
   });
   assert.equal(result.notices.length, 1);
   assert.match(result.notices[0] ?? "", /did not run: Compaction cancelled/);
-  assert.equal(result.compacted, false);
-  assert.equal(result.continued, false);
+  assert.deepEqual(result.order, [NOTICE_TYPE]);
 });
 
-test("user input after the compact call waits, then follows the continuation", async () => {
-  const result = await interruptedRequest(steerAfterAccept, { ui: true });
+test("input during the run reaches the model before compaction, which still runs", async () => {
+  const result = await interruptedRequest(
+    (pi, session) => {
+      pi.on("tool_execution_end", async (event) => {
+        if (event.toolName === "compact") await session().steer(HELD);
+      });
+    },
+    { ui: true, settle: "continuation" },
+  );
   assert.deepEqual(result.notices, []);
-  assert.equal(result.compacted, true);
-  assert.equal(result.continued, true);
-  // The model did not answer the input before compaction, and answered it once afterward.
-  assert.deepEqual(result.replies, ["ok", "", "READY"]);
-  const [continuation, input] = result.answered?.slice(-2) ?? [];
-  assert.match(continuation?.text ?? "", /Agent-authored continuation after compaction/);
-  assert.match(continuation?.text ?? "", /Where they conflict, follow the user's message\./);
-  assert.deepEqual(input, { role: "user", text: HELD });
+  assert.deepEqual(result.order, [
+    `user:${HELD}`,
+    "assistant:READY",
+    "compaction",
+    CONTINUATION_TYPE,
+    "assistant:READY",
+  ]);
+  assert.deepEqual(result.shown, []);
+});
+
+test("input queued before compact runs no longer blocks the request", async () => {
+  const result = await interruptedRequest(
+    (pi, session) => {
+      pi.on("tool_call", async (event) => {
+        if (event.toolName === "compact") await session().steer(HELD);
+      });
+    },
+    { settle: "continuation" },
+  );
+  assert.deepEqual(result.notices, []);
+  assert.deepEqual(result.order, [
+    `user:${HELD}`,
+    "assistant:READY",
+    "compaction",
+    CONTINUATION_TYPE,
+    "assistant:READY",
+  ]);
+});
+
+test("an extension message during the run no longer cancels the request", async () => {
+  const result = await interruptedRequest(
+    (pi) => {
+      pi.on("tool_execution_end", (event) => {
+        if (event.toolName !== "compact") return;
+        pi.sendMessage(
+          { customType: "test-note", content: "extension note", display: true },
+          { triggerTurn: true, deliverAs: "steer" },
+        );
+      });
+    },
+    { settle: "continuation" },
+  );
+  assert.deepEqual(result.notices, []);
+  assert.deepEqual(result.order, [
+    "test-note",
+    "assistant:READY",
+    "compaction",
+    CONTINUATION_TYPE,
+    "assistant:READY",
+  ]);
+});
+
+test("input during compaction follows the continuation as its own message", async () => {
+  const result = await interruptedRequest(
+    (pi, session) => {
+      pi.on("session_before_compact", async () => {
+        await session().followUp(HELD);
+      });
+    },
+    { ui: true, settle: "continuation" },
+  );
+  assert.deepEqual(result.notices, []);
+  // Pi delivers the held message with the continuation or in the next turn.
+  assert.deepEqual(
+    result.order.filter((item) => !item.startsWith("assistant:")),
+    ["compaction", CONTINUATION_TYPE, `user:${HELD}`],
+  );
+  assert.equal(result.order.at(-1), "assistant:READY");
   assert.deepEqual(result.shown, [`Held until compaction finishes: ${HELD}`]);
   assert.equal(result.heldWidget, undefined);
 });
 
-test("user input during compaction waits, then follows the continuation", async () => {
+test("held input follows the notice of a failed compaction", async () => {
   const result = await interruptedRequest((pi, session) => {
     pi.on("session_before_compact", async () => {
       await session().followUp(HELD);
+      return { cancel: true };
     });
-  });
-  assert.deepEqual(result.notices, []);
-  assert.equal(result.compacted, true);
-  assert.equal(result.continued, true);
-  assert.deepEqual(result.replies, ["ok", "", "READY"]);
-  assert.deepEqual(result.answered?.at(-1), { role: "user", text: HELD });
-});
-
-test("held input is delivered after a failed compaction's notice", async () => {
-  const result = await interruptedRequest((pi, session) => {
-    steerAfterAccept(pi, session);
-    pi.on("session_before_compact", () => ({ cancel: true }));
   });
   assert.equal(result.notices.length, 1);
   assert.match(result.notices[0] ?? "", /did not run: Compaction cancelled/);
-  assert.equal(result.compacted, false);
-  assert.equal(result.continued, false);
-  const [notice, input] = result.answered?.slice(-2) ?? [];
-  assert.match(notice?.text ?? "", /did not run: Compaction cancelled/);
-  assert.deepEqual(input, { role: "user", text: HELD });
-});
-
-test("held input returns to the editor when the run is aborted", async () => {
-  const result = await interruptedRequest(
-    (pi, session) => {
-      pi.on("tool_execution_end", async (event, ctx) => {
-        if (event.toolName !== "compact") return;
-        await session().steer(HELD);
-        ctx.abort();
-      });
-    },
-    { ui: true },
+  assert.deepEqual(
+    result.order.filter((item) => !item.startsWith("assistant:")),
+    [NOTICE_TYPE, `user:${HELD}`],
   );
-  assert.equal(result.notices.length, 1);
-  assert.match(result.notices[0] ?? "", /did not run: The run was aborted\./);
-  assert.equal(result.compacted, false);
-  assert.equal(result.answered, undefined);
-  assert.equal(result.editorText, HELD);
-  assert.equal(result.heldWidget, undefined);
+  assert.equal(result.order.at(-1), "assistant:READY");
 });
 
 test("a branch change before compaction cancels the request", async () => {
