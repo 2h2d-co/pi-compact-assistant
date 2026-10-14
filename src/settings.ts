@@ -121,6 +121,19 @@ function tokens(threshold: Threshold, contextWindow: number): number {
   return Math.floor((contextWindow * Number.parseFloat(threshold)) / 100);
 }
 
+/** The thresholds that apply to one model, or false when the settings disable it. */
+function selectedThresholds(settings: Settings, model: string): Thresholds | false {
+  if (!settings.enabled) return false;
+  return Object.hasOwn(settings.models, model)
+    ? (settings.models[model] ?? false)
+    : settings.default;
+}
+
+/** Whether the settings disable the extension for this model. */
+export function isDisabled(settings: Settings, model: string): boolean {
+  return selectedThresholds(settings, model) === false;
+}
+
 /**
  * Resolve token thresholds for one model. Returns undefined when the model is skipped.
  * Throws when a configured preparation threshold is not below the compaction threshold.
@@ -130,10 +143,7 @@ export function resolveThresholds(
   model: string,
   contextWindow: number,
 ): ResolvedThresholds | undefined {
-  if (!settings.enabled) return undefined;
-  const selected = Object.hasOwn(settings.models, model)
-    ? (settings.models[model] ?? false)
-    : settings.default;
+  const selected = selectedThresholds(settings, model);
   if (!selected) return undefined;
   const compactTokens = tokens(selected.compactAt, contextWindow);
   if (selected.prepareAt === undefined) return { compactTokens };

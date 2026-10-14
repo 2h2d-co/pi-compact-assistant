@@ -19,7 +19,14 @@ import {
   NOTICE_TYPE,
   activeInstructions,
 } from "../src/extension.ts";
-import { SYSTEM_INSTRUCTIONS, filler, testRuntime, waitUntil } from "./runtime.ts";
+import {
+  FOLDING_MODEL_ID,
+  SYSTEM_INSTRUCTIONS,
+  filler,
+  testRuntime,
+  waitUntil,
+  type RuntimeOptions,
+} from "./runtime.ts";
 
 const SETTINGS = { default: { prepareAt: 3000, compactAt: 20000 } };
 
@@ -226,6 +233,44 @@ test("only supported providers and models receive instructions", async () => {
   assert.deepEqual(await instructionsAfterLargeRequest({ midConversation: false }), []);
 });
 
+test("compact is declared only to supported models the settings enable", async () => {
+  const declared = async (settings: unknown, options: RuntimeOptions = {}) => {
+    const { runtime, errors } = await testRuntime(settings, undefined, "print", false, options);
+    try {
+      assert.deepEqual(errors, []);
+      return runtime.session.getActiveToolNames().includes("compact");
+    } finally {
+      await runtime.dispose();
+    }
+  };
+  assert.equal(await declared(SETTINGS), true);
+  // Unsupported models.
+  assert.equal(await declared(SETTINGS, { provider: "opencode" }), false);
+  assert.equal(await declared(SETTINGS, { midConversation: false }), false);
+  // Disabled models, including an invalid settings file, which disables every model.
+  assert.equal(await declared({ default: false }), false);
+  assert.equal(await declared({ models: { "anthropic/faux-1": false } }), false);
+  assert.equal(await declared({ enabled: false }), false);
+  assert.equal(await declared({ default: "bad" }), false);
+});
+
+test("switching models hides compact and declares it again", async () => {
+  const { runtime, faux, errors } = await testRuntime(SETTINGS);
+  try {
+    const declared = () => runtime.session.getActiveToolNames().includes("compact");
+    assert.equal(declared(), true);
+    const folding = faux.getModel(FOLDING_MODEL_ID);
+    assert.ok(folding);
+    await runtime.session.setModel(folding);
+    assert.equal(declared(), false);
+    await runtime.session.setModel(faux.getModel());
+    assert.equal(declared(), true);
+    assert.deepEqual(errors, []);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
 test("Codex models require pi-openai-codex-compat 0.0.23 or later when it is loaded", async () => {
   for (const [version, expected] of [
     ["0.0.22", 0],
@@ -413,8 +458,9 @@ async function interruptedRequest(
   { ui = false } = {},
 ) {
   let current: (() => AgentSession) | undefined;
+  // A threshold the test never reaches keeps compact declared without instructions.
   const runtime = await testRuntime(
-    { default: false },
+    { default: { compactAt: "99%" } },
     (pi) => {
       interrupt(pi, () => {
         assert.ok(current);

@@ -28,6 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   continuation in the same turn. An aborted run, a branch change, or a failed compaction cancels
   the request with a notice, and held input follows the notice or returns to the editor after an
   abort.
+  The tool is declared only to supported models that the settings enable.
 - Read token or percentage thresholds from `~/.pi/agent/pi-compact-assistant.json`, with exact
   `provider/modelId` entries and a default for other models. `prepareAt` is optional; without
   it, only the self-contained compaction instruction is posted.

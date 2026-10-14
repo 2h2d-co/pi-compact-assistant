@@ -128,7 +128,14 @@ The extension instructs only models that meet all of these conditions:
 Other models get no instructions, even ones recorded while a supported model was selected. A model
 with its own settings entry, or any Codex model with an outdated `pi-openai-codex-compat`, shows an
 error once per session in interactive and RPC sessions. Models covered only by `default` are
-skipped silently. The `compact` tool stays available to every model.
+skipped silently.
+
+The `compact` tool is declared only to supported models that the settings enable. Unsupported
+models and disabled models do not get it. A model is disabled when its entry under `models` is
+`false`, when it has no entry and `default` is `false`, when `enabled` is `false`, or when the
+settings file is invalid. The extension updates the tool set when a session starts, the model
+changes, or the session branch changes. A model that does not get the tool cannot compact, even
+at the user's request.
 
 ## `compact`
 
@@ -205,7 +212,8 @@ model calls `compact`, compaction runs, and the agent resumes with earlier facts
 scenarios ask the model to compact, then abort the run, change the session branch, or cancel the
 compaction, and check that the continuation is withheld with a notice. Two more send user input
 after the call and during compaction, and check that the input waits for compaction and follows
-the continuation. Release validation runs it against the exact release archive.
+the continuation. Another checks that the provider payload declares `compact` to an enabled
+model and removes it once the model is disabled. Release validation runs it against the exact release archive.
 
 ## Packaging
 

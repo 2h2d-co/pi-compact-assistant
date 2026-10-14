@@ -23,7 +23,7 @@ import { SETTINGS_FILE_NAME } from "../src/settings.ts";
 import { CANCEL_MODE_ENV, type CancelMode } from "./cancel-probe.ts";
 import { archiveEntries, expectedArchiveEntries, packageArchive } from "./package-archive.ts";
 import { isolatePromptPatcher } from "./prompt-patcher.ts";
-import { PROBE_TYPE, type ProbedInstruction } from "./wire-probe.ts";
+import { PROBE_TYPE, TOOLS_PROBE_TYPE, type ProbedInstruction } from "./wire-probe.ts";
 
 type RpcClientModule =
   typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/modes/rpc/rpc-client.js");
@@ -166,7 +166,9 @@ async function prepareLive(t: TestContext, scenario: Scenario, cancel?: CancelMo
     await writeFile(join(agent, scenario.settings.file), JSON.stringify(scenario.settings.value));
   }
   const settingsFile = join(agent, SETTINGS_FILE_NAME);
-  await writeFile(settingsFile, JSON.stringify({ default: false }));
+  // compact is declared only to enabled models. A threshold no test reaches enables the model
+  // without instructions, so the model calls compact only when asked.
+  await writeFile(settingsFile, JSON.stringify({ default: { compactAt: "99%" } }));
   const work = join(temporary, "work");
   await mkdir(work);
   await writeFile(join(work, "facts.txt"), `${FACTS}\n`);
@@ -580,3 +582,48 @@ for (const hold of holds) {
     },
   );
 }
+
+/** compact is declared to an enabled model and hidden from the same model once disabled. */
+test(
+  "live packaged Pi CLI declares compact only to enabled models",
+  { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
+  async (t) => {
+    assert.ok(cancellationScenario);
+    const { provider, model } = cancellationScenario;
+    const { loaded, options, settingsFile } = await prepareLive(t, cancellationScenario);
+    const declared: Record<string, string[]> = {};
+    for (const [label, settings] of [
+      ["enabled", { default: { compactAt: "99%" } }],
+      ["disabled", { models: { [`${provider}/${model}`]: false } }],
+    ] as const) {
+      await writeFile(settingsFile, JSON.stringify(settings));
+      const client: RpcClient = new loaded.RpcClient(options);
+      await client.start();
+      try {
+        await client.promptAndWait("Reply with only the word OK.", undefined, 120_000);
+        const { entries } = await client.getEntries();
+        const names = entries.flatMap((entry) =>
+          entry.type === "custom" &&
+          entry.customType === TOOLS_PROBE_TYPE &&
+          typeof entry.data === "object" &&
+          entry.data !== null &&
+          "names" in entry.data &&
+          Array.isArray(entry.data.names)
+            ? [entry.data.names.map(String)]
+            : [],
+        );
+        assert.ok(
+          names.length > 0,
+          `The ${label} request was probed. Entries: ${outline(entries)}`,
+        );
+        declared[label] = names.at(-1) ?? [];
+      } finally {
+        await client.stop();
+      }
+    }
+    assert.ok(declared["enabled"]?.includes("compact"), JSON.stringify(declared));
+    assert.equal(declared["disabled"]?.includes("compact"), false, JSON.stringify(declared));
+    assert.ok((declared["disabled"]?.length ?? 0) > 0, "Other tools stay declared.");
+    t.diagnostic(`Pi ${piVersion}: compact declared enabled=true, disabled=false.`);
+  },
+);

@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export const PROBE_TYPE = "pi-compact-assistant-live:probe";
+export const TOOLS_PROBE_TYPE = "pi-compact-assistant-live:tools";
 
 export interface ProbedInstruction {
   stage: "prepare" | "compact";
@@ -24,11 +25,51 @@ function textOf(content: unknown): string {
     .join("");
 }
 
+function toolName(value: unknown): string | undefined {
+  return typeof value === "object" &&
+    value !== null &&
+    "name" in value &&
+    typeof value.name === "string"
+    ? value.name
+    : undefined;
+}
+
+/**
+ * The tools a payload leaves declared. Anthropic keeps the first request's `tools` for the prompt
+ * cache and changes the set with `tool_addition` and `tool_removal` blocks in the conversation.
+ */
+function declaredTools(declarations: unknown, items: readonly unknown[]): string[] {
+  const tools: unknown[] = Array.isArray(declarations) ? declarations : [];
+  const names = new Set(tools.flatMap((tool) => toolName(tool) ?? []));
+  for (const item of items) {
+    if (typeof item !== "object" || item === null || !("content" in item)) continue;
+    const blocks: unknown[] = Array.isArray(item.content) ? item.content : [];
+    for (const block of blocks) {
+      if (typeof block !== "object" || block === null || !("type" in block)) continue;
+      if (!("tool" in block) || typeof block.tool !== "object" || block.tool === null) continue;
+      if (block.type === "tool_removal") {
+        const name = toolName(block.tool);
+        if (name) names.delete(name);
+      } else if (block.type === "tool_addition" && "definition" in block.tool) {
+        const name = toolName(block.tool.definition);
+        if (name) names.add(name);
+      }
+    }
+  }
+  return [...names];
+}
+
 /**
  * Live-test fixture. Records where compaction instructions appear in each provider payload:
- * Anthropic Messages `messages`, or Codex Responses `input`.
+ * Anthropic Messages `messages`, or Codex Responses `input`. It also records the names of the
+ * tools each payload declares.
  */
 export default function wireProbe(pi: ExtensionAPI): void {
+  let names: string[] | undefined;
+  pi.on("turn_end", () => {
+    if (names) pi.appendEntry(TOOLS_PROBE_TYPE, { names });
+    names = undefined;
+  });
   pi.on("before_provider_request", (event) => {
     const payload = event.payload;
     if (typeof payload !== "object" || payload === null) return undefined;
@@ -50,6 +91,9 @@ export default function wireProbe(pi: ExtensionAPI): void {
       if (stage) found.push({ stage, role: String(item.role), index, count: items.length });
     });
     if (found.length > 0) pi.appendEntry(PROBE_TYPE, { found });
+    // Appending an entry while compaction runs makes native compaction cancel, so the names are
+    // recorded when the turn ends.
+    names = declaredTools("tools" in payload ? payload.tools : undefined, items);
     return undefined;
   });
 }

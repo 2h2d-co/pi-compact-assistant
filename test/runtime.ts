@@ -22,6 +22,8 @@ import { SETTINGS_FILE_NAME } from "../src/settings.ts";
 
 export const SYSTEM_INSTRUCTIONS = "Base test instructions: Never deploy without approval.";
 export const CONTEXT_WINDOW = 100_000;
+/** A second scripted model that does not accept mid-conversation system messages. */
+export const FOLDING_MODEL_ID = "faux-folding";
 
 export interface RuntimeOptions {
   /** Provider name of the scripted model. Defaults to the supported `anthropic`. */
@@ -92,11 +94,17 @@ export async function testRuntime(
   }
   const faux = fauxProvider({
     provider: options.provider ?? "anthropic",
-    models: [{ id: "faux-1", contextWindow: CONTEXT_WINDOW }],
+    models: [
+      { id: "faux-1", contextWindow: CONTEXT_WINDOW },
+      { id: FOLDING_MODEL_ID, contextWindow: CONTEXT_WINDOW },
+    ],
   });
   for (const model of faux.models) {
     Object.assign(model, {
-      compat: { supportsMidConvoSystemMessages: options.midConversation ?? true },
+      compat: {
+        supportsMidConvoSystemMessages:
+          model.id !== FOLDING_MODEL_ID && (options.midConversation ?? true),
+      },
     });
   }
   const modelRuntime = await ModelRuntime.create({

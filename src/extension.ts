@@ -17,7 +17,7 @@ import {
   type Stage,
 } from "./instructions.ts";
 import { requirePiVersion } from "./pi-version.ts";
-import { loadSettings, resolveThresholds, type Settings } from "./settings.ts";
+import { isDisabled, loadSettings, resolveThresholds, type Settings } from "./settings.ts";
 import { findCodexCompatProblem, unsupportedReason } from "./support.ts";
 
 export const INSTRUCTION_TYPE = "pi-compact-assistant:instruction";
@@ -215,6 +215,27 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     if (ctx.hasUI) ctx.ui.notify(message, "error");
   }
 
+  /**
+   * Whether the model is unsupported or disabled. Without valid settings the extension is
+   * inactive, so every model counts as disabled.
+   */
+  function excluded(model: ExtensionContext["model"]): boolean {
+    if (!settings || !model) return true;
+    if (unsupportedReason(model, codexCompatProblem)) return true;
+    return isDisabled(settings, `${model.provider}/${model.id}`);
+  }
+
+  /** Declare `compact` only to supported models the settings enable. */
+  function showTool(model: ExtensionContext["model"]): void {
+    const active = pi.getActiveTools();
+    const shown = active.includes(COMPACT_TOOL_NAME);
+    if (excluded(model)) {
+      if (shown) pi.setActiveTools(active.filter((name) => name !== COMPACT_TOOL_NAME));
+    } else if (!shown) {
+      pi.setActiveTools([...active, COMPACT_TOOL_NAME]);
+    }
+  }
+
   function assertCurrent(request: Request, ctx: ExtensionContext): void {
     const branch = ctx.sessionManager.getBranch();
     const start = branch.findIndex((entry) => entry.id === request.assistantId);
@@ -300,13 +321,19 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       report(ctx, "settings", `pi-compact-assistant is inactive. ${errorText(error)}`);
     }
     codexCompatProblem = await findCodexCompatProblem(pi);
+    showTool(ctx.model);
   });
   pi.on("session_shutdown", () => {
     pending = undefined;
     epoch++;
   });
-  pi.on("session_tree", () => {
+  pi.on("session_tree", (_event, ctx) => {
     epoch++;
+    // Pi restores the tool loadout the branch declared, which may predate a model switch.
+    showTool(ctx.model);
+  });
+  pi.on("model_select", (event) => {
+    showTool(event.model);
   });
   // User input after an accepted request waits until compaction finishes, then follows the
   // continuation. Input from extensions is not held.
