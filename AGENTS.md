@@ -34,3 +34,4 @@
   and the version's changelog section. Never create GitHub releases by hand. Stable versions use
   `latest`; prereleases derive a non-`latest` dist-tag from their first prerelease identifier.
 - Publication and installation into a user's live Pi configuration are separate operations.
+- Live tests report every error they meet as a test diagnostic, even when they pass: extension error and warning notices, extension errors, and failed responses. Use `test/error-log.ts`. Summarize failed responses by stop reason, HTTP status, and error category; never print provider error text or credentials.

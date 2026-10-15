@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   copyFile,
@@ -22,6 +22,7 @@ import manifest from "../package.json" with { type: "json" };
 import { CONTINUATION_TYPE, INSTRUCTION_TYPE, NOTICE_TYPE } from "../src/extension.ts";
 import { SETTINGS_FILE_NAME } from "../src/settings.ts";
 import { CANCEL_MODE_ENV, type CancelMode } from "./cancel-probe.ts";
+import { describeFailure, errorLog } from "./error-log.ts";
 import { HOLD_DIR_ENV, STARTED_FILE, TYPED_FILE } from "./compaction-probe.ts";
 import { archiveEntries, expectedArchiveEntries, packageArchive } from "./package-archive.ts";
 import { isolatePromptPatcher } from "./prompt-patcher.ts";
@@ -86,7 +87,7 @@ function outline(entries: readonly SessionEntry[]): string {
         const calls = message.content.flatMap((block) =>
           block.type === "toolCall" ? [block.name] : [],
         );
-        return `assistant(${message.stopReason}${calls.length ? `:${calls.join(",")}` : ""}${message.errorMessage ? `:${message.errorMessage.slice(0, 200)}` : ""})`;
+        return `assistant(${message.stopReason}${calls.length ? `:${calls.join(",")}` : ""}${message.errorMessage ? `:${describeFailure(message)}` : ""})`;
       }
       if (message.role === "toolResult") {
         return `toolResult(${message.toolName}${message.isError ? ":error" : ""})`;
@@ -209,7 +210,7 @@ async function prepareLive(
       join(root, "test/wire-probe.ts"),
     ],
   };
-  return { loaded, options, settingsFile, work, sessionFile, temporary };
+  return { loaded, options, settingsFile, work, sessionFile, temporary, errors: errorLog(t) };
 }
 
 const anthropicCompatSettings = {
@@ -265,8 +266,9 @@ for (const scenario of scenarios) {
     `live packaged Pi CLI ${scenario.provider}/${scenario.model} ${scenario.compat ? `with ${scenario.compat}` : "without a compat extension"}${scenario.compactOnly ? " with only compactAt" : ""} instructs, compacts, and resumes`,
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 900_000 },
     async (t) => {
-      const { loaded, options, settingsFile, work } = await prepareLive(t, scenario);
+      const { loaded, options, settingsFile, work, errors } = await prepareLive(t, scenario);
       let client: RpcClient = new loaded.RpcClient(options);
+      client.onEvent(errors.rpcEvent);
       t.after(async () => client.stop());
 
       async function turn(prompt: string): Promise<void> {
@@ -283,7 +285,7 @@ for (const scenario of scenarios) {
           .filter((message) => message.role === "assistant")
           .at(-1);
         assert.ok(assistant?.role === "assistant");
-        assert.equal(assistant.stopReason, "stop", assistant.errorMessage);
+        assert.equal(assistant.stopReason, "stop", describeFailure(assistant));
         return assistant.content.map((block) => (block.type === "text" ? block.text : "")).join("");
       }
 
@@ -306,6 +308,7 @@ for (const scenario of scenarios) {
       );
 
       client = new loaded.RpcClient(options);
+      client.onEvent(errors.rpcEvent);
       await client.start();
       if (!scenario.compactOnly) {
         await turn("Use the read tool to read pad1.txt. Reply with the word on its last line.");
@@ -463,10 +466,11 @@ for (const cancellation of cancellations) {
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
     async (t) => {
       assert.ok(cancellationScenario);
-      const { loaded, options } = await prepareLive(t, cancellationScenario, {
+      const { loaded, options, errors } = await prepareLive(t, cancellationScenario, {
         cancel: cancellation.mode,
       });
       const client: RpcClient = new loaded.RpcClient(options);
+      client.onEvent(errors.rpcEvent);
       t.after(async () => client.stop());
       await client.start();
       await client.promptAndWait(COMPACT_PROMPT, undefined, 240_000);
@@ -527,8 +531,9 @@ for (const hold of holds) {
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
     async (t) => {
       assert.ok(cancellationScenario);
-      const { loaded, options } = await prepareLive(t, cancellationScenario);
+      const { loaded, options, errors } = await prepareLive(t, cancellationScenario);
       const client: RpcClient = new loaded.RpcClient(options);
+      client.onEvent(errors.rpcEvent);
       t.after(async () => client.stop());
       await client.start();
       let sent: Promise<unknown> | undefined;
@@ -607,7 +612,7 @@ test(
   async (t) => {
     assert.ok(cancellationScenario);
     const { provider, model } = cancellationScenario;
-    const { loaded, options, settingsFile } = await prepareLive(t, cancellationScenario);
+    const { loaded, options, settingsFile, errors } = await prepareLive(t, cancellationScenario);
     const declared: Record<string, string[]> = {};
     for (const [label, settings] of [
       ["enabled", { default: { compactAt: "99%" } }],
@@ -615,6 +620,7 @@ test(
     ] as const) {
       await writeFile(settingsFile, JSON.stringify(settings));
       const client: RpcClient = new loaded.RpcClient(options);
+      client.onEvent(errors.rpcEvent);
       await client.start();
       try {
         await client.promptAndWait("Reply with only the word OK.", undefined, 120_000);
@@ -644,6 +650,11 @@ test(
     t.diagnostic(`Pi ${piVersion}: compact declared enabled=true, disabled=false.`);
   },
 );
+
+/** The messages among session entries. */
+function messages(entries: readonly SessionEntry[]) {
+  return entries.flatMap((entry) => (entry.type === "message" ? [entry.message] : []));
+}
 
 /** The entries Pi wrote to a session file, without its header. */
 async function sessionEntries(file: string): Promise<SessionEntry[]> {
@@ -715,8 +726,8 @@ for (const output of ["text", "json"] as const) {
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
     async (t) => {
       assert.ok(cancellationScenario);
-      const { options, sessionFile } = await prepareLive(t, cancellationScenario);
-      const stdout = execFileSync(
+      const { options, sessionFile, errors } = await prepareLive(t, cancellationScenario);
+      const run = spawnSync(
         process.execPath,
         [
           options.cliPath,
@@ -735,10 +746,14 @@ for (const output of ["text", "json"] as const) {
           encoding: "utf8",
           timeout: 480_000,
           maxBuffer: 64 * 1024 * 1024,
-          stdio: ["ignore", "pipe", "inherit"],
+          stdio: ["ignore", "pipe", "pipe"],
         },
       );
       const entries = await sessionEntries(sessionFile);
+      errors.printRun(run.stderr, messages(entries));
+      assert.equal(run.error, undefined, "Pi started and finished within the timeout.");
+      assert.equal(run.status, 0, `Pi exited with status ${String(run.status)}.`);
+      const { stdout } = run;
       const order = compactionOrder(entries);
       assert.ok(
         order.call >= 0 &&
@@ -799,7 +814,7 @@ test(
   },
   async (t) => {
     assert.ok(cancellationScenario);
-    const { options, sessionFile, temporary } = await prepareLive(t, cancellationScenario, {
+    const { options, sessionFile, temporary, errors } = await prepareLive(t, cancellationScenario, {
       hold: true,
     });
     const command = [
@@ -835,77 +850,88 @@ test(
     t.after(() => {
       if (child.exitCode === null && child.pid) process.kill(-child.pid, "SIGKILL");
     });
-    async function until(label: string, done: () => boolean | Promise<boolean>): Promise<void> {
-      for (let attempt = 0; attempt < 240; attempt++) {
-        if (await done()) return;
-        assert.equal(
-          child.exitCode,
-          null,
-          `Pi exited while waiting for ${label}. Screen: ${visibleText(output).slice(-2000)}`,
-        );
-        await setTimeout(1000);
+    try {
+      async function until(label: string, done: () => boolean | Promise<boolean>): Promise<void> {
+        for (let attempt = 0; attempt < 240; attempt++) {
+          if (await done()) return;
+          assert.equal(
+            child.exitCode,
+            null,
+            `Pi exited while waiting for ${label}. Screen: ${visibleText(output).slice(-2000)}`,
+          );
+          await setTimeout(1000);
+        }
+        assert.fail(`Timed out waiting for ${label}. Screen: ${visibleText(output).slice(-2000)}`);
       }
-      assert.fail(`Timed out waiting for ${label}. Screen: ${visibleText(output).slice(-2000)}`);
-    }
 
-    await until("compaction to start", () => existsSync(join(temporary, STARTED_FILE)));
-    child.stdin.write(HELD_INPUT);
-    await setTimeout(500);
-    child.stdin.write("\r");
-    await until("the TUI to queue the input", () =>
-      visibleText(output).includes("Queued message for after compaction"),
-    );
-    await writeFile(join(temporary, TYPED_FILE), "");
-
-    const heldIndex = (entries: readonly SessionEntry[]) =>
-      entries.findIndex(
-        (entry) =>
-          entry.type === "message" &&
-          entry.message.role === "user" &&
-          JSON.stringify(entry.message.content).includes(HELD_INPUT),
+      await until("compaction to start", () => existsSync(join(temporary, STARTED_FILE)));
+      child.stdin.write(HELD_INPUT);
+      await setTimeout(500);
+      child.stdin.write("\r");
+      await until("the TUI to queue the input", () =>
+        visibleText(output).includes("Queued message for after compaction"),
       );
-    const answered = (entries: readonly SessionEntry[]) => {
+      await writeFile(join(temporary, TYPED_FILE), "");
+
+      const heldIndex = (entries: readonly SessionEntry[]) =>
+        entries.findIndex(
+          (entry) =>
+            entry.type === "message" &&
+            entry.message.role === "user" &&
+            JSON.stringify(entry.message.content).includes(HELD_INPUT),
+        );
+      const answered = (entries: readonly SessionEntry[]) => {
+        const held = heldIndex(entries);
+        return (
+          held >= 0 &&
+          entries
+            .slice(held + 1)
+            .some(
+              (entry) =>
+                entry.type === "message" &&
+                entry.message.role === "assistant" &&
+                entry.message.stopReason === "stop",
+            )
+        );
+      };
+      let entries: SessionEntry[] = [];
+      await until("the reply to the typed input", async () => {
+        entries = await sessionEntries(sessionFile);
+        return answered(entries);
+      });
+      assert.doesNotMatch(visibleText(output), /Extension error|Failed to load extension/);
+      const order = compactionOrder(entries);
       const held = heldIndex(entries);
-      return (
-        held >= 0 &&
-        entries
-          .slice(held + 1)
-          .some(
-            (entry) =>
-              entry.type === "message" &&
-              entry.message.role === "assistant" &&
-              entry.message.stopReason === "stop",
-          )
+      assert.ok(
+        order.call >= 0 && order.call < order.compaction && order.compaction < order.continuation,
+        `Compact call, compaction, then the continuation. Entries: ${outline(entries)}`,
       );
-    };
-    let entries: SessionEntry[] = [];
-    await until("the reply to the typed input", async () => {
-      entries = await sessionEntries(sessionFile);
-      return answered(entries);
-    });
-    assert.doesNotMatch(visibleText(output), /Extension error|Failed to load extension/);
-    const order = compactionOrder(entries);
-    const held = heldIndex(entries);
-    assert.ok(
-      order.call >= 0 && order.call < order.compaction && order.compaction < order.continuation,
-      `Compact call, compaction, then the continuation. Entries: ${outline(entries)}`,
-    );
-    assert.ok(
-      order.continuation < held,
-      `The typed input follows the continuation. Entries: ${outline(entries)}`,
-    );
-    assert.equal(
-      entries.some((entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE),
-      false,
-      `No cancellation notice. Entries: ${outline(entries)}`,
-    );
-    const reply = entries
-      .slice(held + 1)
-      .find((entry) => entry.type === "message" && entry.message.role === "assistant");
-    const replyText = assistantText(reply) ?? "";
-    assert.match(replyText, /READY/, "The model answers the typed input.");
-    t.diagnostic(
-      `Pi ${piVersion} interactive TUI: input typed during compaction followed the continuation: ${JSON.stringify(replyText.slice(0, 80))}.`,
-    );
+      assert.ok(
+        order.continuation < held,
+        `The typed input follows the continuation. Entries: ${outline(entries)}`,
+      );
+      assert.equal(
+        entries.some(
+          (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
+        ),
+        false,
+        `No cancellation notice. Entries: ${outline(entries)}`,
+      );
+      const reply = entries
+        .slice(held + 1)
+        .find((entry) => entry.type === "message" && entry.message.role === "assistant");
+      const replyText = assistantText(reply) ?? "";
+      assert.match(replyText, /READY/, "The model answers the typed input.");
+      t.diagnostic(
+        `Pi ${piVersion} interactive TUI: input typed during compaction followed the continuation: ${JSON.stringify(replyText.slice(0, 80))}.`,
+      );
+    } finally {
+      // The TUI shows notices only on screen, so report extension error lines and failed responses.
+      const screen = visibleText(output)
+        .split("\n")
+        .map((line) => line.trim())
+        .join("\n");
+      errors.printRun(screen, messages(await sessionEntries(sessionFile)));
+    }
   },
 );
