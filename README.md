@@ -16,8 +16,8 @@ Codex as `developer` messages, in place in the conversation.
 
 ## Requirements and loading
 
-Tested with Pi **1.1.0** and Node.js **22.23.3**. The package requires Pi `>=1.1.0 <1.2.0` and
-Node.js `>=22.19.0`. The extension refuses to load on a Pi older than 1.1.0, because Pi does not
+Tested with Pi **1.2.0** and Node.js **22.23.3**. The package requires Pi `>=1.2.0 <1.3.0` and
+Node.js `>=22.19.0`. The extension refuses to load on a Pi older than 1.2.0, because Pi does not
 enforce the peer range when it installs packages.
 
 **Pi's virtual models are not supported.** Pi's experimental virtual models, registered with
@@ -118,7 +118,7 @@ record the state in a Markdown state file under the same rules before calling `c
 The extension instructs only models that meet all of these conditions:
 
 - the provider is `anthropic` or `openai-codex`, the request paths the live tests cover;
-- Pi marks the model as accepting system messages mid-conversation. Pi 1.1.0 marks Claude Fable 5,
+- Pi marks the model as accepting system messages mid-conversation. Pi 1.2.0 marks Claude Fable 5,
   Fable 5.1, Opus 4.8, Opus 5, Opus 5.5, Sonnet 5.5, and Haiku 5.5, and the Codex GPT-5.5,
   GPT-5.6, GPT-6, and GPT-6.1 models this way. For other models Pi would fold each instruction
   into the leading system prompt, which changes the cached prefix; and
