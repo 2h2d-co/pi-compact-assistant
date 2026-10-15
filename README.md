@@ -190,9 +190,9 @@ never files, processes, or permissions.
 ## Compat extensions
 
 - **`pi-anthropic-compat`**: the native Anthropic compaction handles `compact`. Live tests pass
-  with Claude Fable 5.1.
+  with Claude Sonnet 5.5.
 - Without a compat extension, Pi's built-in Anthropic provider receives the instructions as system
-  messages, and Pi writes the summary. Live tests pass with Claude Fable 5.1.
+  messages, and Pi writes the summary. Live tests pass with Claude Sonnet 5.5.
 - **`pi-openai-codex-compat`** 0.0.23 or later: Codex remote compaction handles `compact`, and the
   instructions reach Codex as developer messages. Live tests pass with GPT-6.1 Sol. Version 0.0.22
   and earlier drop the instructions, because they build Codex requests only from the stored session.

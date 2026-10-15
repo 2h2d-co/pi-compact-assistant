@@ -219,7 +219,7 @@ const anthropicCompatSettings = {
 const scenarios = [
   {
     provider: "anthropic",
-    model: "claude-fable-5-1",
+    model: "claude-sonnet-5-5",
     role: "system",
     compat: "pi-anthropic-compat",
     settings: anthropicCompatSettings,
@@ -228,7 +228,7 @@ const scenarios = [
   // Without prepareAt, only the self-contained compaction instruction is posted.
   {
     provider: "anthropic",
-    model: "claude-fable-5-1",
+    model: "claude-sonnet-5-5",
     role: "system",
     compat: "pi-anthropic-compat",
     settings: anthropicCompatSettings,
@@ -237,7 +237,7 @@ const scenarios = [
   // Pi's built-in Anthropic provider sends the instructions and summarizes with Pi's compaction.
   {
     provider: "anthropic",
-    model: "claude-fable-5-1",
+    model: "claude-sonnet-5-5",
     role: "system",
     compat: undefined,
     settings: undefined,
