@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   copyFile,
@@ -16,11 +16,13 @@ import { dirname, join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 import { getAgentDir, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import manifest from "../package.json" with { type: "json" };
 import { CONTINUATION_TYPE, INSTRUCTION_TYPE, NOTICE_TYPE } from "../src/extension.ts";
 import { SETTINGS_FILE_NAME } from "../src/settings.ts";
 import { CANCEL_MODE_ENV, type CancelMode } from "./cancel-probe.ts";
+import { HOLD_DIR_ENV, STARTED_FILE, TYPED_FILE } from "./compaction-probe.ts";
 import { archiveEntries, expectedArchiveEntries, packageArchive } from "./package-archive.ts";
 import { isolatePromptPatcher } from "./prompt-patcher.ts";
 import { PROBE_TYPE, TOOLS_PROBE_TYPE, type ProbedInstruction } from "./wire-probe.ts";
@@ -113,7 +115,11 @@ interface Scenario {
  * Unpack the release candidate and prepare isolated agent state with the real login, the pinned
  * prompt patcher, and the scenario's compat extension. Returns RPC client options for Pi.
  */
-async function prepareLive(t: TestContext, scenario: Scenario, cancel?: CancelMode) {
+async function prepareLive(
+  t: TestContext,
+  scenario: Scenario,
+  { cancel, hold = false }: { cancel?: CancelMode; hold?: boolean } = {},
+) {
   const temporary = await mkdtemp(join(tmpdir(), "pi-compact-assistant-live-"));
   t.after(() => rm(temporary, { recursive: true, force: true }));
   // A release passes its exact staged-index archive; otherwise pack this worktree.
@@ -174,6 +180,7 @@ async function prepareLive(t: TestContext, scenario: Scenario, cancel?: CancelMo
   await writeFile(join(work, "facts.txt"), `${FACTS}\n`);
   await writeFile(join(work, "pad1.txt"), pad(3000, "amber"));
   await writeFile(join(work, "pad2.txt"), pad(7000, "cobalt"));
+  const sessionFile = join(temporary, "session.jsonl");
 
   const options = {
     cliPath: cli,
@@ -184,13 +191,15 @@ async function prepareLive(t: TestContext, scenario: Scenario, cancel?: CancelMo
       PI_CODING_AGENT_DIR: agent,
       PI_TELEMETRY: "0",
       ...(cancel ? { [CANCEL_MODE_ENV]: cancel } : {}),
+      ...(hold ? { [HOLD_DIR_ENV]: temporary } : {}),
     },
     args: [
       "--thinking",
       "low",
       "--session",
-      join(temporary, "session.jsonl"),
+      sessionFile,
       ...(cancel ? ["-e", join(root, "test/cancel-probe.ts")] : []),
+      ...(hold ? ["-e", join(root, "test/compaction-probe.ts")] : []),
       "-e",
       packageRoot,
       ...(scenario.compat ? ["-e", join(root, "node_modules", scenario.compat)] : []),
@@ -200,7 +209,7 @@ async function prepareLive(t: TestContext, scenario: Scenario, cancel?: CancelMo
       join(root, "test/wire-probe.ts"),
     ],
   };
-  return { loaded, options, settingsFile, work };
+  return { loaded, options, settingsFile, work, sessionFile, temporary };
 }
 
 const anthropicCompatSettings = {
@@ -454,7 +463,9 @@ for (const cancellation of cancellations) {
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
     async (t) => {
       assert.ok(cancellationScenario);
-      const { loaded, options } = await prepareLive(t, cancellationScenario, cancellation.mode);
+      const { loaded, options } = await prepareLive(t, cancellationScenario, {
+        cancel: cancellation.mode,
+      });
       const client: RpcClient = new loaded.RpcClient(options);
       t.after(async () => client.stop());
       await client.start();
@@ -631,5 +642,270 @@ test(
     assert.equal(declared["disabled"]?.includes("compact"), false, JSON.stringify(declared));
     assert.ok((declared["disabled"]?.length ?? 0) > 0, "Other tools stay declared.");
     t.diagnostic(`Pi ${piVersion}: compact declared enabled=true, disabled=false.`);
+  },
+);
+
+/** The entries Pi wrote to a session file, without its header. */
+async function sessionEntries(file: string): Promise<SessionEntry[]> {
+  if (!existsSync(file)) return [];
+  return (await readFile(file, "utf8"))
+    .split("\n")
+    .filter((line) => line.trim())
+    .flatMap((line): SessionEntry[] => {
+      const entry: unknown = JSON.parse(line);
+      return isSessionEntry(entry) ? [entry] : [];
+    });
+}
+
+function isSessionEntry(value: unknown): value is SessionEntry {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "type" in value &&
+    typeof value.type === "string" &&
+    value.type !== "session"
+  );
+}
+
+/** The `type` of each JSON-mode event line. */
+function eventTypes(stdout: string): string[] {
+  return stdout
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => {
+      const event: unknown = JSON.parse(line);
+      return typeof event === "object" && event !== null && "type" in event
+        ? String(event.type)
+        : "";
+    });
+}
+
+/** The indexes of the compact call, the compaction, the continuation, and the reply to it. */
+function compactionOrder(entries: readonly SessionEntry[]) {
+  const call = entries.findIndex(
+    (entry) =>
+      entry.type === "message" &&
+      entry.message.role === "assistant" &&
+      entry.message.content.some((block) => block.type === "toolCall" && block.name === "compact"),
+  );
+  const compaction = entries.findIndex((entry) => entry.type === "compaction");
+  const continuation = entries.findIndex(
+    (entry) => entry.type === "custom_message" && entry.customType === CONTINUATION_TYPE,
+  );
+  const reply =
+    continuation < 0
+      ? -1
+      : entries.findIndex(
+          (entry, index) =>
+            index > continuation &&
+            entry.type === "message" &&
+            entry.message.role === "assistant" &&
+            entry.message.stopReason === "stop",
+        );
+  return { call, compaction, continuation, reply };
+}
+
+/**
+ * A print or JSON run ends when its prompt returns. It must still run the compaction and the
+ * continuation's turn before it exits.
+ */
+for (const output of ["text", "json"] as const) {
+  test(
+    `live packaged Pi CLI ${output} print run compacts and answers the continuation before it exits`,
+    { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
+    async (t) => {
+      assert.ok(cancellationScenario);
+      const { options, sessionFile } = await prepareLive(t, cancellationScenario);
+      const stdout = execFileSync(
+        process.execPath,
+        [
+          options.cliPath,
+          "--provider",
+          options.provider,
+          "--model",
+          options.model,
+          ...options.args,
+          ...(output === "json" ? ["--mode", "json"] : []),
+          "-p",
+          COMPACT_PROMPT,
+        ],
+        {
+          cwd: options.cwd,
+          env: { ...process.env, ...options.env },
+          encoding: "utf8",
+          timeout: 480_000,
+          maxBuffer: 64 * 1024 * 1024,
+          stdio: ["ignore", "pipe", "inherit"],
+        },
+      );
+      const entries = await sessionEntries(sessionFile);
+      const order = compactionOrder(entries);
+      assert.ok(
+        order.call >= 0 &&
+          order.call < order.compaction &&
+          order.compaction < order.continuation &&
+          order.continuation < order.reply,
+        `Compact call, compaction, continuation, then its reply. Entries: ${outline(entries)}`,
+      );
+      assert.equal(
+        entries.some(
+          (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
+        ),
+        false,
+        `No cancellation notice. Entries: ${outline(entries)}`,
+      );
+      const reply = assistantText(entries[order.reply]) ?? "";
+      assert.match(reply, /RESUMED/);
+      if (output === "text") {
+        // Text mode prints the last assistant message, so the run ended after the reply.
+        assert.equal(stdout.trim(), reply.trim());
+      } else {
+        const events = eventTypes(stdout);
+        const compactionEnd = events.indexOf("compaction_end");
+        const lastEnd = events.lastIndexOf("agent_end");
+        assert.ok(
+          compactionEnd >= 0 && compactionEnd < lastEnd,
+          `JSON events show compaction, then the continuation's run: ${events.join(",")}`,
+        );
+      }
+      t.diagnostic(
+        `Pi ${piVersion} ${output} print run: compacted and answered the continuation (${JSON.stringify(reply.slice(0, 40))}) before exiting.`,
+      );
+    },
+  );
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/** Terminal output with escape sequences removed. */
+function visibleText(output: string): string {
+  return stripVTControlCharacters(output);
+}
+
+/**
+ * In the interactive TUI, input typed during compaction waits in the editor's compaction queue,
+ * then follows the continuation as its own message. The TUI runs in a pseudo-terminal from the
+ * operating system's `script` utility.
+ */
+test(
+  "live packaged Pi CLI interactive session sends input typed during compaction after the continuation",
+  {
+    skip:
+      process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1" ||
+      (process.platform !== "darwin" && process.platform !== "linux"),
+    timeout: 600_000,
+  },
+  async (t) => {
+    assert.ok(cancellationScenario);
+    const { options, sessionFile, temporary } = await prepareLive(t, cancellationScenario, {
+      hold: true,
+    });
+    const command = [
+      process.execPath,
+      options.cliPath,
+      "--provider",
+      options.provider,
+      "--model",
+      options.model,
+      ...options.args,
+      COMPACT_PROMPT,
+    ];
+    // A fixed size, because the pseudo-terminal starts without one.
+    const inner = `stty cols 120 rows 40 && exec ${command.map(shellQuote).join(" ")}`;
+    const pty =
+      process.platform === "darwin"
+        ? ["script", "-q", "/dev/null", "/bin/sh", "-c", inner]
+        : ["script", "-qfec", `/bin/sh -c ${shellQuote(inner)}`, "/dev/null"];
+    // Node gives the child a socket for stdin, and macOS `script` needs a pipe, so `cat` relays.
+    const child = spawn("/bin/sh", ["-c", `cat | exec ${pty.map(shellQuote).join(" ")}`], {
+      cwd: options.cwd,
+      env: { ...process.env, ...options.env, TERM: "xterm-256color" },
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
+    });
+    let output = "";
+    child.stdout.on("data", (data: Buffer) => {
+      output += data.toString();
+    });
+    child.stderr.on("data", (data: Buffer) => {
+      output += data.toString();
+    });
+    t.after(() => {
+      if (child.exitCode === null && child.pid) process.kill(-child.pid, "SIGKILL");
+    });
+    async function until(label: string, done: () => boolean | Promise<boolean>): Promise<void> {
+      for (let attempt = 0; attempt < 240; attempt++) {
+        if (await done()) return;
+        assert.equal(
+          child.exitCode,
+          null,
+          `Pi exited while waiting for ${label}. Screen: ${visibleText(output).slice(-2000)}`,
+        );
+        await setTimeout(1000);
+      }
+      assert.fail(`Timed out waiting for ${label}. Screen: ${visibleText(output).slice(-2000)}`);
+    }
+
+    await until("compaction to start", () => existsSync(join(temporary, STARTED_FILE)));
+    child.stdin.write(HELD_INPUT);
+    await setTimeout(500);
+    child.stdin.write("\r");
+    await until("the TUI to queue the input", () =>
+      visibleText(output).includes("Queued message for after compaction"),
+    );
+    await writeFile(join(temporary, TYPED_FILE), "");
+
+    const heldIndex = (entries: readonly SessionEntry[]) =>
+      entries.findIndex(
+        (entry) =>
+          entry.type === "message" &&
+          entry.message.role === "user" &&
+          JSON.stringify(entry.message.content).includes(HELD_INPUT),
+      );
+    const answered = (entries: readonly SessionEntry[]) => {
+      const held = heldIndex(entries);
+      return (
+        held >= 0 &&
+        entries
+          .slice(held + 1)
+          .some(
+            (entry) =>
+              entry.type === "message" &&
+              entry.message.role === "assistant" &&
+              entry.message.stopReason === "stop",
+          )
+      );
+    };
+    let entries: SessionEntry[] = [];
+    await until("the reply to the typed input", async () => {
+      entries = await sessionEntries(sessionFile);
+      return answered(entries);
+    });
+    assert.doesNotMatch(visibleText(output), /Extension error|Failed to load extension/);
+    const order = compactionOrder(entries);
+    const held = heldIndex(entries);
+    assert.ok(
+      order.call >= 0 && order.call < order.compaction && order.compaction < order.continuation,
+      `Compact call, compaction, then the continuation. Entries: ${outline(entries)}`,
+    );
+    assert.ok(
+      order.continuation < held,
+      `The typed input follows the continuation. Entries: ${outline(entries)}`,
+    );
+    assert.equal(
+      entries.some((entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE),
+      false,
+      `No cancellation notice. Entries: ${outline(entries)}`,
+    );
+    const reply = entries
+      .slice(held + 1)
+      .find((entry) => entry.type === "message" && entry.message.role === "assistant");
+    const replyText = assistantText(reply) ?? "";
+    assert.match(replyText, /READY/, "The model answers the typed input.");
+    t.diagnostic(
+      `Pi ${piVersion} interactive TUI: input typed during compaction followed the continuation: ${JSON.stringify(replyText.slice(0, 80))}.`,
+    );
   },
 );

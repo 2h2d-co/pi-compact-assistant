@@ -215,12 +215,15 @@ npm run pack:dry
 uses your Pi login through an isolated agent directory, loads the pinned system prompt patcher and
 the provider's compat extension, and checks that both instructions reach the provider payload, the
 model calls `compact`, compaction runs, and the agent resumes with earlier facts intact. Further
-scenarios ask the model to compact, then abort the run, change the session branch, or cancel the
-compaction, and check that the continuation is withheld with a notice. Two more send user input
-while the model calls `compact` and during compaction. They check that compaction still runs,
-that the first input reaches the model before compaction, and that the second follows the
-continuation as its own message. Another checks that the provider payload declares `compact` to an enabled
-model and removes it once the model is disabled. Release validation runs it against the exact release archive.
+scenarios ask the model to compact, then abort the run or cancel the compaction, and check that
+the continuation is withheld with a notice. Two more send user input through RPC while the model
+calls `compact` and during compaction. They check that compaction still runs, that the first input
+reaches the model before compaction, and that the second follows the continuation as its own
+message. Print runs in text and JSON mode must compact and answer the continuation before they
+exit. An interactive TUI run, in a pseudo-terminal from the operating system's `script` utility
+on macOS or Linux, types input during compaction and checks that it follows the continuation.
+Another checks that the provider payload declares `compact` to an enabled model and removes it
+once the model is disabled. Release validation runs it against the exact release archive.
 
 ## Packaging
 
