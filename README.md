@@ -11,8 +11,9 @@ automatic compaction interrupts it.
 - `compact` runs Pi's compaction after the turn ends, then delivers the model's continuation
   message and resumes the agent.
 
-The instructions are system messages. Anthropic receives them as `system` messages and OpenAI
-Codex as `developer` messages, in place in the conversation.
+The instructions are mid-conversation system messages. Anthropic receives them as `system`
+messages and OpenAI Codex as `developer` messages, in place in the conversation. The top-level
+system prompt, Anthropic's `system` field or Codex's `instructions` field, stays unchanged.
 
 ## Requirements and loading
 
@@ -92,6 +93,10 @@ recorded instructions as system messages directly after those entries. The instr
 - stay at the same position in later requests, so prompt-cache prefixes stay valid;
 - stop after a compaction, until usage reaches a threshold again; and
 - contain no usage figures, so their text is the same in every session.
+
+The interactive TUI draws each recorded instruction in the transcript as a box with its stage and
+the token count at which it was added. Expand tool output, `ctrl+o` by default, to see the exact
+instruction text. The box is not sent to the model. RPC clients get a notice instead.
 
 The preparation instruction, `[Compaction preparation]`, tells the model not to stop or wrap up
 early, because compaction does not end the task. The model records the goal, constraints,
@@ -213,15 +218,17 @@ npm run pack:dry
 
 `npm run test:live` packs the extension and runs the packaged Pi CLI against real providers. It
 uses your Pi login through an isolated agent directory, loads the pinned system prompt patcher and
-the provider's compat extension, and checks that both instructions reach the provider payload, the
-model calls `compact`, compaction runs, and the agent resumes with earlier facts intact. Further
-scenarios ask the model to compact, then abort the run or cancel the compaction, and check that
-the continuation is withheld with a notice. Two more send user input through RPC while the model
+the provider's compat extension, and checks that both instructions reach the provider payload as
+mid-conversation items beside an unchanged top-level system prompt, the model calls `compact`,
+compaction runs, and the agent resumes with earlier facts intact. Further scenarios ask the model
+to compact, then abort the run or cancel the compaction, and check that the continuation is
+withheld with a notice. Two more send user input through RPC while the model
 calls `compact` and during compaction. They check that compaction still runs, that the first input
 reaches the model before compaction, and that the second follows the continuation as its own
 message. Print runs in text and JSON mode must compact and answer the continuation before they
 exit. An interactive TUI run, in a pseudo-terminal from the operating system's `script` utility
 on macOS or Linux, types input during compaction and checks that it follows the continuation.
+A second TUI run checks that a recorded instruction appears in the transcript as a box.
 Another checks that the provider payload declares `compact` to an enabled model and removes it
 once the model is disabled. Release validation runs it against the exact release archive.
 

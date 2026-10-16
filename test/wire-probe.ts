@@ -8,6 +8,15 @@ export interface ProbedInstruction {
   role: string;
   index: number;
   count: number;
+  /** Characters in the payload's top-level system prompt. */
+  systemLength: number;
+  /** Whether the top-level system prompt equals that of the latest request without instructions. */
+  systemUnchanged: boolean;
+  /**
+   * Whether the instruction's text appears in the top-level system prompt. The `compact` tool's
+   * guidelines name the instruction labels there, so the labels alone do not count.
+   */
+  systemHasInstruction: boolean;
 }
 
 function textOf(content: unknown): string {
@@ -59,13 +68,21 @@ function declaredTools(declarations: unknown, items: readonly unknown[]): string
   return [...names];
 }
 
+/** The top-level system prompt: Anthropic Messages `system`, or Codex Responses `instructions`. */
+function topLevelSystem(payload: { system?: unknown; instructions?: unknown }): string {
+  return textOf(payload.system ?? payload.instructions);
+}
+
 /**
  * Live-test fixture. Records where compaction instructions appear in each provider payload:
- * Anthropic Messages `messages`, or Codex Responses `input`. It also records the names of the
- * tools each payload declares.
+ * Anthropic Messages `messages`, or Codex Responses `input`, and whether the payload's top-level
+ * system prompt stayed as it was before the instructions. It also records the names of the tools
+ * each payload declares.
  */
 export default function wireProbe(pi: ExtensionAPI): void {
   let names: string[] | undefined;
+  /** The top-level system prompt of the latest request without instructions. */
+  let baseline: string | undefined;
   pi.on("turn_end", () => {
     if (names) pi.appendEntry(TOOLS_PROBE_TYPE, { names });
     names = undefined;
@@ -79,6 +96,7 @@ export default function wireProbe(pi: ExtensionAPI): void {
         : "input" in payload && Array.isArray(payload.input)
           ? payload.input
           : [];
+    const system = topLevelSystem(payload);
     const found: ProbedInstruction[] = [];
     items.forEach((item: unknown, index: number) => {
       if (typeof item !== "object" || item === null || !("role" in item)) return;
@@ -88,9 +106,20 @@ export default function wireProbe(pi: ExtensionAPI): void {
         : text.startsWith("[Compaction required]")
           ? "compact"
           : undefined;
-      if (stage) found.push({ stage, role: String(item.role), index, count: items.length });
+      if (stage) {
+        found.push({
+          stage,
+          role: String(item.role),
+          index,
+          count: items.length,
+          systemLength: system.length,
+          systemUnchanged: baseline !== undefined && system === baseline,
+          systemHasInstruction: system.includes(text),
+        });
+      }
     });
     if (found.length > 0) pi.appendEntry(PROBE_TYPE, { found });
+    else baseline = system;
     // Appending an entry while compaction runs makes native compaction cancel, so the names are
     // recorded when the turn ends.
     names = declaredTools("tools" in payload ? payload.tools : undefined, items);

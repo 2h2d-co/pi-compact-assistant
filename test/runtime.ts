@@ -32,7 +32,7 @@ export interface RuntimeOptions {
   midConversation?: boolean;
   /** Extension files Pi loads from disk, so their source metadata names real paths. */
   extensionPaths?: string[];
-  /** Bind a UI that records the editor text and widgets. */
+  /** Bind a UI that records the editor text, widgets, and notices. */
   ui?: boolean;
 }
 
@@ -42,6 +42,8 @@ export interface UiState {
   widgets: Map<string, string[]>;
   /** Every widget line shown, in order. */
   shown: string[];
+  /** Every notice shown, in order. */
+  notices: string[];
 }
 
 /** Pi spreads the UI and calls only the methods an extension uses. */
@@ -51,10 +53,12 @@ function isUi(
   return "setWidget" in value && "setEditorText" in value;
 }
 
-/** A UI that records the editor text and widgets, the methods pi-compact-assistant uses. */
+/** A UI that records the editor text, widgets, and notices, the methods pi-compact-assistant uses. */
 function recordingUi(state: UiState): ExtensionUIContext {
   const ui: Pick<ExtensionUIContext, "notify" | "setWidget" | "getEditorText" | "setEditorText"> = {
-    notify: () => undefined,
+    notify: (message) => {
+      state.notices.push(message);
+    },
     setWidget: (name: string, content: unknown) => {
       if (Array.isArray(content)) {
         state.widgets.set(name, content.map(String));
@@ -115,7 +119,7 @@ export async function testRuntime(
     refreshOnCreate: false,
   });
   const errors: string[] = [];
-  const ui: UiState = { editorText: "", widgets: new Map(), shown: [] };
+  const ui: UiState = { editorText: "", widgets: new Map(), shown: [], notices: [] };
   const createRuntime: CreateAgentSessionRuntimeFactory = async (sessionOptions) => {
     const services = await createAgentSessionServices({
       cwd,

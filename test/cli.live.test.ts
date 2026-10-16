@@ -59,7 +59,13 @@ function isProbedInstruction(value: unknown): value is ProbedInstruction {
     "stage" in value &&
     "role" in value &&
     "index" in value &&
-    typeof value.index === "number"
+    typeof value.index === "number" &&
+    "systemLength" in value &&
+    typeof value.systemLength === "number" &&
+    "systemUnchanged" in value &&
+    typeof value.systemUnchanged === "boolean" &&
+    "systemHasInstruction" in value &&
+    typeof value.systemHasInstruction === "boolean"
   );
 }
 
@@ -213,6 +219,9 @@ async function prepareLive(
   return { loaded, options, settingsFile, work, sessionFile, temporary, errors: errorLog(t) };
 }
 
+/** RPC client options for Pi from {@link prepareLive}. */
+type LiveOptions = Awaited<ReturnType<typeof prepareLive>>["options"];
+
 const anthropicCompatSettings = {
   file: "pi-anthropic-compat.json",
   value: { enabled: true, keepRecentTokens: 0 },
@@ -361,6 +370,18 @@ for (const scenario of scenarios) {
         for (const item of seen) {
           assert.equal(item.role, scenario.role);
           assert.ok(item.index > 0, "The instruction is a mid-conversation item.");
+          // The instruction steers mid-conversation and leaves the top-level system prompt alone.
+          assert.ok(item.systemLength > 0, "The request keeps its top-level system prompt.");
+          assert.equal(
+            item.systemUnchanged,
+            true,
+            "The top-level system prompt equals the one sent before the instructions.",
+          );
+          assert.equal(
+            item.systemHasInstruction,
+            false,
+            "No instruction is folded into the top-level system prompt.",
+          );
         }
       }
       const call = entries.findIndex(
@@ -419,7 +440,7 @@ for (const scenario of scenarios) {
         );
       }
       t.diagnostic(
-        `Pi ${piVersion} with ${scenario.compat ?? "no compat extension"}: ${scenario.compactOnly ? "the self-contained compact instruction" : "prepare and compact instructions"} reached ${scenario.provider}/${scenario.model} as ${scenario.role} items; the model compacted and resumed.`,
+        `Pi ${piVersion} with ${scenario.compat ?? "no compat extension"}: ${scenario.compactOnly ? "the self-contained compact instruction" : "prepare and compact instructions"} reached ${scenario.provider}/${scenario.model} as mid-conversation ${scenario.role} items beside an unchanged ${found[0]?.systemLength ?? 0}-character top-level system prompt; the model compacted and resumed.`,
       );
     },
   );
@@ -799,17 +820,81 @@ function visibleText(output: string): string {
   return stripVTControlCharacters(output);
 }
 
+const tuiSupported = process.platform === "darwin" || process.platform === "linux";
+
+/**
+ * Start the interactive TUI with `prompt` in a pseudo-terminal from the operating system's
+ * `script` utility. `until` polls a condition and fails with the screen when Pi exits or two
+ * hundred and forty seconds pass.
+ */
+function launchTui(t: TestContext, options: LiveOptions, prompt: string) {
+  const command = [
+    process.execPath,
+    options.cliPath,
+    "--provider",
+    options.provider,
+    "--model",
+    options.model,
+    ...options.args,
+    prompt,
+  ];
+  // A fixed size, because the pseudo-terminal starts without one.
+  const inner = `stty cols 120 rows 40 && exec ${command.map(shellQuote).join(" ")}`;
+  const pty =
+    process.platform === "darwin"
+      ? ["script", "-q", "/dev/null", "/bin/sh", "-c", inner]
+      : ["script", "-qfec", `/bin/sh -c ${shellQuote(inner)}`, "/dev/null"];
+  // Node gives the child a socket for stdin, and macOS `script` needs a pipe, so `cat` relays.
+  const child = spawn("/bin/sh", ["-c", `cat | exec ${pty.map(shellQuote).join(" ")}`], {
+    cwd: options.cwd,
+    env: { ...process.env, ...options.env, TERM: "xterm-256color" },
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: true,
+  });
+  let output = "";
+  child.stdout.on("data", (data: Buffer) => {
+    output += data.toString();
+  });
+  child.stderr.on("data", (data: Buffer) => {
+    output += data.toString();
+  });
+  t.after(() => {
+    if (child.exitCode === null && child.pid) process.kill(-child.pid, "SIGKILL");
+  });
+  const screen = () => visibleText(output);
+  async function until(label: string, done: () => boolean | Promise<boolean>): Promise<void> {
+    for (let attempt = 0; attempt < 240; attempt++) {
+      if (await done()) return;
+      assert.equal(
+        child.exitCode,
+        null,
+        `Pi exited while waiting for ${label}. Screen: ${screen().slice(-2000)}`,
+      );
+      await setTimeout(1000);
+    }
+    assert.fail(`Timed out waiting for ${label}. Screen: ${screen().slice(-2000)}`);
+  }
+  return {
+    screen,
+    until,
+    type: (text: string) => child.stdin.write(text),
+    /** Screen lines trimmed for the error log, which reads extension error lines. */
+    trimmedScreen: () =>
+      screen()
+        .split("\n")
+        .map((line) => line.trim())
+        .join("\n"),
+  };
+}
+
 /**
  * In the interactive TUI, input typed during compaction waits in the editor's compaction queue,
- * then follows the continuation as its own message. The TUI runs in a pseudo-terminal from the
- * operating system's `script` utility.
+ * then follows the continuation as its own message.
  */
 test(
   "live packaged Pi CLI interactive session sends input typed during compaction after the continuation",
   {
-    skip:
-      process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1" ||
-      (process.platform !== "darwin" && process.platform !== "linux"),
+    skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1" || !tuiSupported,
     timeout: 600_000,
   },
   async (t) => {
@@ -817,59 +902,14 @@ test(
     const { options, sessionFile, temporary, errors } = await prepareLive(t, cancellationScenario, {
       hold: true,
     });
-    const command = [
-      process.execPath,
-      options.cliPath,
-      "--provider",
-      options.provider,
-      "--model",
-      options.model,
-      ...options.args,
-      COMPACT_PROMPT,
-    ];
-    // A fixed size, because the pseudo-terminal starts without one.
-    const inner = `stty cols 120 rows 40 && exec ${command.map(shellQuote).join(" ")}`;
-    const pty =
-      process.platform === "darwin"
-        ? ["script", "-q", "/dev/null", "/bin/sh", "-c", inner]
-        : ["script", "-qfec", `/bin/sh -c ${shellQuote(inner)}`, "/dev/null"];
-    // Node gives the child a socket for stdin, and macOS `script` needs a pipe, so `cat` relays.
-    const child = spawn("/bin/sh", ["-c", `cat | exec ${pty.map(shellQuote).join(" ")}`], {
-      cwd: options.cwd,
-      env: { ...process.env, ...options.env, TERM: "xterm-256color" },
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
-    });
-    let output = "";
-    child.stdout.on("data", (data: Buffer) => {
-      output += data.toString();
-    });
-    child.stderr.on("data", (data: Buffer) => {
-      output += data.toString();
-    });
-    t.after(() => {
-      if (child.exitCode === null && child.pid) process.kill(-child.pid, "SIGKILL");
-    });
+    const tui = launchTui(t, options, COMPACT_PROMPT);
     try {
-      async function until(label: string, done: () => boolean | Promise<boolean>): Promise<void> {
-        for (let attempt = 0; attempt < 240; attempt++) {
-          if (await done()) return;
-          assert.equal(
-            child.exitCode,
-            null,
-            `Pi exited while waiting for ${label}. Screen: ${visibleText(output).slice(-2000)}`,
-          );
-          await setTimeout(1000);
-        }
-        assert.fail(`Timed out waiting for ${label}. Screen: ${visibleText(output).slice(-2000)}`);
-      }
-
-      await until("compaction to start", () => existsSync(join(temporary, STARTED_FILE)));
-      child.stdin.write(HELD_INPUT);
+      await tui.until("compaction to start", () => existsSync(join(temporary, STARTED_FILE)));
+      tui.type(HELD_INPUT);
       await setTimeout(500);
-      child.stdin.write("\r");
-      await until("the TUI to queue the input", () =>
-        visibleText(output).includes("Queued message for after compaction"),
+      tui.type("\r");
+      await tui.until("the TUI to queue the input", () =>
+        tui.screen().includes("Queued message for after compaction"),
       );
       await writeFile(join(temporary, TYPED_FILE), "");
 
@@ -895,11 +935,11 @@ test(
         );
       };
       let entries: SessionEntry[] = [];
-      await until("the reply to the typed input", async () => {
+      await tui.until("the reply to the typed input", async () => {
         entries = await sessionEntries(sessionFile);
         return answered(entries);
       });
-      assert.doesNotMatch(visibleText(output), /Extension error|Failed to load extension/);
+      assert.doesNotMatch(tui.screen(), /Extension error|Failed to load extension/);
       const order = compactionOrder(entries);
       const held = heldIndex(entries);
       assert.ok(
@@ -927,11 +967,54 @@ test(
       );
     } finally {
       // The TUI shows notices only on screen, so report extension error lines and failed responses.
-      const screen = visibleText(output)
-        .split("\n")
-        .map((line) => line.trim())
-        .join("\n");
-      errors.printRun(screen, messages(await sessionEntries(sessionFile)));
+      errors.printRun(tui.trimmedScreen(), messages(await sessionEntries(sessionFile)));
+    }
+  },
+);
+
+/**
+ * The interactive TUI draws a recorded instruction in the transcript as a box, instead of a
+ * passing status notice. A one-token preparation threshold records it on the first request.
+ */
+test(
+  "live packaged Pi CLI interactive session draws a recorded instruction in the transcript",
+  {
+    skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1" || !tuiSupported,
+    timeout: 600_000,
+  },
+  async (t) => {
+    assert.ok(cancellationScenario);
+    const { options, settingsFile, sessionFile, errors } = await prepareLive(
+      t,
+      cancellationScenario,
+    );
+    await writeFile(settingsFile, JSON.stringify({ default: { prepareAt: 1, compactAt: "99%" } }));
+    const tui = launchTui(t, options, "Do not use any tools. Reply with only the word OK.");
+    try {
+      let entries: SessionEntry[] = [];
+      await tui.until("the reply", async () => {
+        entries = await sessionEntries(sessionFile);
+        return entries.some(
+          (entry) =>
+            entry.type === "message" &&
+            entry.message.role === "assistant" &&
+            entry.message.stopReason === "stop",
+        );
+      });
+      assert.ok(
+        entries.some((entry) => entry.type === "custom" && entry.customType === INSTRUCTION_TYPE),
+        `The preparation instruction was recorded. Entries: ${outline(entries)}`,
+      );
+      await tui.until("the instruction box", () =>
+        /\[Compaction preparation\] Added at [\d,]+ tokens/.test(tui.screen()),
+      );
+      assert.doesNotMatch(tui.screen(), /Compaction preparation instruction added at/);
+      assert.doesNotMatch(tui.screen(), /renderer failed|Extension error|Failed to load extension/);
+      t.diagnostic(
+        `Pi ${piVersion} interactive TUI: the preparation instruction appeared in the transcript as a box, with no status notice.`,
+      );
+    } finally {
+      errors.printRun(tui.trimmedScreen(), messages(await sessionEntries(sessionFile)));
     }
   },
 );

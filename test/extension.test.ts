@@ -3,21 +3,25 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { stripVTControlCharacters } from "node:util";
 import { Type } from "typebox";
 import {
   fauxAssistantMessage,
   fauxToolCall,
   getCurrentSystemPrompt,
+  getSystemMessageText,
   type FauxResponseFactory,
   type Message,
 } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionFactory, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { KeybindingsManager, getKeybindings, setKeybindings } from "@earendil-works/pi-tui";
 import {
   CONTINUATION_TYPE,
   HELD_WIDGET,
   INSTRUCTION_TYPE,
   NOTICE_TYPE,
   activeInstructions,
+  renderInstruction,
 } from "../src/extension.ts";
 import {
   FOLDING_MODEL_ID,
@@ -80,6 +84,14 @@ test("records each stage once and keeps its system message at a fixed position",
     // After a preparation instruction, the compaction instruction refers to its state file.
     assert.match(fourth[1]?.text ?? "", /Update the state file so it records the current state/);
     assert.match(fourth[1]?.after ?? "", /^fourth request/);
+    // The instructions are later system messages. The leading system prompt stays unchanged.
+    for (const request of seen) {
+      const leading = request[0];
+      assert.ok(leading?.role === "system");
+      assert.equal(JSON.stringify(leading), JSON.stringify(seen[0]?.[0]));
+      assert.match(getSystemMessageText(leading), new RegExp(SYSTEM_INSTRUCTIONS));
+      assert.doesNotMatch(getSystemMessageText(leading), /\[Compaction/);
+    }
     // The serialized bytes of an earlier request prefix remain unchanged.
     const prefix = seen[2]?.length ?? 0;
     assert.equal(JSON.stringify(seen[3]?.slice(0, prefix)), JSON.stringify(seen[2]));
@@ -97,6 +109,136 @@ test("records each stage once and keeps its system message at a fixed position",
   } finally {
     await runtime.dispose();
   }
+});
+
+/**
+ * Pi's default expand binding. The interactive TUI installs Pi's keybindings. Offline tests install
+ * this one.
+ */
+const EXPAND_KEY = {
+  "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+} as const;
+
+/** A theme that leaves text unstyled, so rendered lines compare as plain text. */
+const plainTheme = {
+  fg: (_color: string, text: string) => text,
+  bg: (_color: string, text: string) => text,
+  bold: (text: string) => text,
+};
+
+function rendered(entry: SessionEntry | undefined, expanded: boolean): string {
+  assert.ok(entry?.type === "custom");
+  const component = renderInstruction(entry, { expanded }, plainTheme);
+  assert.ok(component, "The instruction entry renders.");
+  return (
+    component
+      .render(200)
+      // The box pads each line by one column.
+      .map((line) => stripVTControlCharacters(line).replace(/^ /, "").trimEnd())
+      .join("\n")
+      .trim()
+  );
+}
+
+test("the TUI draws each recorded instruction in the transcript instead of a notice", async (t) => {
+  const previous = getKeybindings();
+  setKeybindings(new KeybindingsManager(EXPAND_KEY));
+  t.after(() => {
+    setKeybindings(previous);
+  });
+  const { runtime, faux, errors, ui } = await testRuntime(SETTINGS, undefined, "tui", false, {
+    ui: true,
+  });
+  try {
+    faux.setResponses([fauxAssistantMessage("ok"), fauxAssistantMessage("ok")]);
+    await runtime.session.prompt(`first request ${filler(3500)}`);
+    await runtime.session.prompt(`second request ${filler(20000)}`);
+    assert.equal(
+      runtime.session.extensionRunner.getEntryRenderer(INSTRUCTION_TYPE),
+      renderInstruction,
+    );
+    const entries = runtime.session.sessionManager
+      .getEntries()
+      .filter((entry) => entry.type === "custom" && entry.customType === INSTRUCTION_TYPE);
+    assert.equal(entries.length, 2);
+    const [prepare, compact] = entries;
+
+    const collapsed = rendered(prepare, false);
+    assert.match(
+      collapsed,
+      /^\[Compaction preparation\] Added at [\d,]+ tokens, \d+% of the 100,000-token context window\. ctrl\+o to view the instruction$/,
+    );
+    assert.doesNotMatch(collapsed, /\n/);
+    const expanded = rendered(prepare, true);
+    assert.ok(prepare?.type === "custom" && typeof prepare.data === "object");
+    assert.ok(prepare.data !== null && "text" in prepare.data);
+    assert.ok(typeof prepare.data.text === "string");
+    // Expanded, the box shows the exact instruction after the summary line.
+    assert.ok(expanded.endsWith(prepare.data.text), expanded);
+    assert.doesNotMatch(expanded, /to view the instruction/);
+    assert.match(rendered(compact, false), /^\[Compaction required\] Added at /);
+    assert.deepEqual(ui.notices, []);
+    assert.deepEqual(errors, []);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("RPC clients get a notice for each recorded instruction", async () => {
+  const { runtime, faux, errors, ui } = await testRuntime(SETTINGS, undefined, "rpc", false, {
+    ui: true,
+  });
+  try {
+    faux.setResponses([fauxAssistantMessage("ok"), fauxAssistantMessage("ok")]);
+    await runtime.session.prompt(`first request ${filler(3500)}`);
+    await runtime.session.prompt(`second request ${filler(20000)}`);
+    assert.equal(ui.notices.length, 2);
+    assert.match(
+      ui.notices[0] ?? "",
+      /^Compaction preparation instruction added at [\d,]+ tokens\.$/,
+    );
+    assert.match(ui.notices[1] ?? "", /^Compaction instruction added at [\d,]+ tokens\.$/);
+    assert.deepEqual(errors, []);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("the renderer skips data that is not an instruction record", () => {
+  assert.equal(
+    renderInstruction({ data: { stage: "later" } }, { expanded: true }, plainTheme),
+    undefined,
+  );
+});
+
+test("the collapsed instruction shows no hint when no key expands it", (t) => {
+  const previous = getKeybindings();
+  setKeybindings(new KeybindingsManager(EXPAND_KEY, { "app.tools.expand": [] }));
+  t.after(() => {
+    setKeybindings(previous);
+  });
+  const component = renderInstruction(
+    {
+      data: {
+        stage: "compact",
+        anchorEntryId: "anchor",
+        text: "[Compaction required]\nCall compact.",
+        model: "anthropic/faux-1",
+        tokens: 80_000,
+        contextWindow: 100_000,
+        timestamp: 1,
+      },
+    },
+    { expanded: false },
+    plainTheme,
+  );
+  assert.deepEqual(
+    component
+      ?.render(200)
+      .map((line) => stripVTControlCharacters(line).trim())
+      .filter(Boolean),
+    ["[Compaction required] Added at 80,000 tokens, 80% of the 100,000-token context window."],
+  );
 });
 
 test("messages that share a timestamp keep the instruction at its anchor", async (t) => {

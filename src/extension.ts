@@ -1,12 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, keyText } from "@earendil-works/pi-coding-agent";
 import type {
   ContextWithSystemEvent,
+  CustomEntry,
+  EntryRenderOptions,
   ExtensionAPI,
   ExtensionContext,
   InputEvent,
   SessionEntry,
+  Theme,
 } from "@earendil-works/pi-coding-agent";
+import { Box, Spacer, Text, type Component } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -95,6 +99,48 @@ function isInstructionRecord(value: unknown): value is InstructionRecord {
     "timestamp" in value &&
     typeof value.timestamp === "number"
   );
+}
+
+const STAGE_LABELS: Record<Stage, string> = {
+  prepare: "[Compaction preparation]",
+  compact: "[Compaction required]",
+};
+
+function tokenSummary(record: InstructionRecord): string {
+  if (!Number.isFinite(record.tokens)) return "Added to the conversation.";
+  const tokens = record.tokens.toLocaleString("en-US");
+  if (!Number.isFinite(record.contextWindow) || record.contextWindow <= 0) {
+    return `Added at ${tokens} tokens.`;
+  }
+  const percent = Math.round((record.tokens / record.contextWindow) * 100);
+  return `Added at ${tokens} tokens, ${percent}% of the ${record.contextWindow.toLocaleString("en-US")}-token context window.`;
+}
+
+/**
+ * Draw a recorded instruction in the interactive transcript. Expanded, it shows the exact text
+ * the model receives. The entry itself stays out of model context.
+ */
+export function renderInstruction(
+  entry: Pick<CustomEntry, "data">,
+  options: EntryRenderOptions,
+  theme: Pick<Theme, "fg" | "bg" | "bold">,
+): Component | undefined {
+  const record = entry.data;
+  if (!isInstructionRecord(record)) return undefined;
+  const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+  const summary = `${theme.fg("customMessageLabel", theme.bold(STAGE_LABELS[record.stage]))} ${theme.fg("customMessageText", tokenSummary(record))}`;
+  const key = keyText("app.tools.expand");
+  // Without a bound expand key there is nothing to press, so no hint is shown.
+  const hint =
+    options.expanded || !key
+      ? ""
+      : ` ${theme.fg("dim", key)}${theme.fg("muted", " to view the instruction")}`;
+  box.addChild(new Text(`${summary}${hint}`, 0, 0));
+  if (options.expanded) {
+    box.addChild(new Spacer(1));
+    box.addChild(new Text(theme.fg("customMessageText", record.text), 0, 0));
+  }
+  return box;
 }
 
 /** Instructions recorded on the current branch since its latest compaction. */
@@ -203,6 +249,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
   let codexCompatProblem: string | undefined;
   let pending: Request | undefined;
   const reported = new Set<string>();
+  pi.registerEntryRenderer(INSTRUCTION_TYPE, renderInstruction);
 
   function report(ctx: ExtensionContext, key: string, message: string): void {
     if (reported.has(key)) return;
@@ -360,7 +407,8 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       };
       pi.appendEntry(INSTRUCTION_TYPE, record);
       records.push(record);
-      if (ctx.hasUI) {
+      // The TUI draws the entry in the transcript. RPC clients get a notice instead.
+      if (ctx.hasUI && ctx.mode !== "tui") {
         ctx.ui.notify(
           stage === "prepare"
             ? `Compaction preparation instruction added at ${usage.tokens.toLocaleString("en-US")} tokens.`
