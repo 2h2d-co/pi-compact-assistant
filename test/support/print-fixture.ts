@@ -5,7 +5,7 @@ import {
   type FauxResponseFactory,
 } from "@earendil-works/pi-ai";
 import { runPrintMode } from "@earendil-works/pi-coding-agent";
-import { CONTINUATION_TYPE } from "../src/extension.ts";
+import { CONTINUATION_TYPE } from "../../src/extension.ts";
 import { filler, testRuntime } from "./runtime.ts";
 
 // Loads the packaged entry, which reads pi-compact-assistant.json from PI_CODING_AGENT_DIR.

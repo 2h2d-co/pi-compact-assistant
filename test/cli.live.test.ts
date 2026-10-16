@@ -21,12 +21,16 @@ import { getAgentDir, type SessionEntry } from "@earendil-works/pi-coding-agent"
 import manifest from "../package.json" with { type: "json" };
 import { CONTINUATION_TYPE, INSTRUCTION_TYPE, NOTICE_TYPE } from "../src/extension.ts";
 import { SETTINGS_FILE_NAME } from "../src/settings.ts";
-import { CANCEL_MODE_ENV, type CancelMode } from "./cancel-probe.ts";
-import { describeFailure, errorLog } from "./error-log.ts";
-import { HOLD_DIR_ENV, STARTED_FILE, TYPED_FILE } from "./compaction-probe.ts";
-import { archiveEntries, expectedArchiveEntries, packageArchive } from "./package-archive.ts";
-import { isolatePromptPatcher } from "./prompt-patcher.ts";
-import { PROBE_TYPE, TOOLS_PROBE_TYPE, type ProbedInstruction } from "./wire-probe.ts";
+import { CANCEL_MODE_ENV, type CancelMode } from "./support/cancel-probe.ts";
+import { describeFailure, errorLog } from "./support/error-log.ts";
+import { HOLD_DIR_ENV, STARTED_FILE, TYPED_FILE } from "./support/compaction-probe.ts";
+import {
+  archiveEntries,
+  expectedArchiveEntries,
+  packageArchive,
+} from "./support/package-archive.ts";
+import { isolatePromptPatcher } from "./support/prompt-patcher.ts";
+import { PROBE_TYPE, TOOLS_PROBE_TYPE, type ProbedInstruction } from "./support/wire-probe.ts";
 
 type RpcClientModule =
   typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/modes/rpc/rpc-client.js");
@@ -205,15 +209,15 @@ async function prepareLive(
       "low",
       "--session",
       sessionFile,
-      ...(cancel ? ["-e", join(root, "test/cancel-probe.ts")] : []),
-      ...(hold ? ["-e", join(root, "test/compaction-probe.ts")] : []),
+      ...(cancel ? ["-e", join(root, "test/support/cancel-probe.ts")] : []),
+      ...(hold ? ["-e", join(root, "test/support/compaction-probe.ts")] : []),
       "-e",
       packageRoot,
       ...(scenario.compat ? ["-e", join(root, "node_modules", scenario.compat)] : []),
       "-e",
       join(root, "node_modules/pi-system-prompt-patcher"),
       "-e",
-      join(root, "test/wire-probe.ts"),
+      join(root, "test/support/wire-probe.ts"),
     ],
   };
   return { loaded, options, settingsFile, work, sessionFile, temporary, errors: errorLog(t) };

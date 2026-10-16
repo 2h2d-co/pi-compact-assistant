@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
-const fixture = fileURLToPath(new URL("./print-fixture.ts", import.meta.url));
+const fixture = fileURLToPath(new URL("./support/print-fixture.ts", import.meta.url));
 
 for (const output of ["text", "json"]) {
   test(`Pi ${output} host waits for compaction and the continuation`, async () => {

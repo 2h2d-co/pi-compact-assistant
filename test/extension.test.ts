@@ -30,7 +30,7 @@ import {
   testRuntime,
   waitUntil,
   type RuntimeOptions,
-} from "./runtime.ts";
+} from "./support/runtime.ts";
 
 const SETTINGS = { default: { prepareAt: 3000, compactAt: 20000 } };
 

@@ -17,8 +17,8 @@ import {
   type ExtensionFactory,
   type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { compactAssistant } from "../src/extension.ts";
-import { SETTINGS_FILE_NAME } from "../src/settings.ts";
+import { compactAssistant } from "../../src/extension.ts";
+import { SETTINGS_FILE_NAME } from "../../src/settings.ts";
 
 export const SYSTEM_INSTRUCTIONS = "Base test instructions: Never deploy without approval.";
 export const CONTEXT_WINDOW = 100_000;
@@ -138,7 +138,7 @@ export async function testRuntime(
         noContextFiles: true,
         // The packaged entry reads its settings from Pi's agent directory.
         additionalExtensionPaths: [
-          ...(entry ? [fileURLToPath(new URL("../extensions/index.ts", import.meta.url))] : []),
+          ...(entry ? [fileURLToPath(new URL("../../extensions/index.ts", import.meta.url))] : []),
           ...(options.extensionPaths ?? []),
         ],
         extensionFactories: [

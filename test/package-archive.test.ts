@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
-import { archiveEntries, expectedArchiveEntries, packageArchive } from "./package-archive.ts";
+import {
+  archiveEntries,
+  expectedArchiveEntries,
+  packageArchive,
+} from "./support/package-archive.ts";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
