@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Require Pi `>=1.3.0 <1.4.0`.
 - The interactive TUI shows each recorded compaction instruction in the transcript as a box with
   its stage and token count, instead of a passing status line. Expanding tool output shows the
   exact instruction text. The box stays out of model context, and it reappears when a session is
