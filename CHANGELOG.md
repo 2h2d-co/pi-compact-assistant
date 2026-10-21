@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-10-21
+
 ### Changed
 
 - Declare the `compact` tool only once usage reaches `compactAt`, with the `[Compaction required]`
