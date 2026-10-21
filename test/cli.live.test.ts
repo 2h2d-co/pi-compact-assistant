@@ -17,7 +17,11 @@ import { setTimeout } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { stripVTControlCharacters } from "node:util";
-import { getAgentDir, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import {
+  calculateContextTokens,
+  getAgentDir,
+  type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import manifest from "../package.json" with { type: "json" };
 import { CONTINUATION_TYPE, INSTRUCTION_TYPE, NOTICE_TYPE } from "../src/extension.ts";
 import { SETTINGS_FILE_NAME } from "../src/settings.ts";
@@ -30,7 +34,12 @@ import {
   packageArchive,
 } from "./support/package-archive.ts";
 import { isolatePromptPatcher } from "./support/prompt-patcher.ts";
-import { PROBE_TYPE, TOOLS_PROBE_TYPE, type ProbedInstruction } from "./support/wire-probe.ts";
+import {
+  PROBE_TYPE,
+  TOOLS_PROBE_TYPE,
+  type ProbedInstruction,
+  type ProbedTools,
+} from "./support/wire-probe.ts";
 
 type RpcClientModule =
   typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/modes/rpc/rpc-client.js");
@@ -79,6 +88,23 @@ function probes(entries: readonly SessionEntry[]): ProbedInstruction[] {
     const data: unknown = entry.data;
     if (typeof data !== "object" || data === null || !("found" in data)) return [];
     return Array.isArray(data.found) ? data.found.filter(isProbedInstruction) : [];
+  });
+}
+
+function stringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+/** The tools each request declared, in request order, with the index of its probe entry. */
+function toolProbes(entries: readonly SessionEntry[]): (ProbedTools & { entry: number })[] {
+  return entries.flatMap((entry, index) => {
+    if (entry.type !== "custom" || entry.customType !== TOOLS_PROBE_TYPE) return [];
+    const data: unknown = entry.data;
+    if (typeof data !== "object" || data === null) return [];
+    if (!("names" in data && "top" in data && "stages" in data)) return [];
+    const { names, top, stages } = data;
+    if (!stringArray(names) || !stringArray(top) || !stringArray(stages)) return [];
+    return [{ names, top, stages, entry: index }];
   });
 }
 
@@ -183,8 +209,7 @@ async function prepareLive(
     await writeFile(join(agent, scenario.settings.file), JSON.stringify(scenario.settings.value));
   }
   const settingsFile = join(agent, SETTINGS_FILE_NAME);
-  // compact is declared only to enabled models. A threshold no test reaches enables the model
-  // without instructions, so the model calls compact only when asked.
+  // A threshold no request reaches enables the model without instructions or `compact`.
   await writeFile(settingsFile, JSON.stringify({ default: { compactAt: "99%" } }));
   const work = join(temporary, "work");
   await mkdir(work);
@@ -225,6 +250,59 @@ async function prepareLive(
 
 /** RPC client options for Pi from {@link prepareLive}. */
 type LiveOptions = Awaited<ReturnType<typeof prepareLive>>["options"];
+
+/** Run Pi in print mode with `prompt` on the live session. */
+function runPrint(options: LiveOptions, prompt: string, extraArgs: readonly string[] = []) {
+  return spawnSync(
+    process.execPath,
+    [
+      options.cliPath,
+      "--provider",
+      options.provider,
+      "--model",
+      options.model,
+      ...options.args,
+      ...extraArgs,
+      "-p",
+      prompt,
+    ],
+    {
+      cwd: options.cwd,
+      env: { ...process.env, ...options.env },
+      encoding: "utf8",
+      timeout: 480_000,
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+}
+
+/** Tokens past the measured context at which {@link armCompaction} sets `compactAt`. */
+const ARMED_MARGIN = 3000;
+
+/**
+ * Measure the session's context after one small turn, then set `compactAt` {@link ARMED_MARGIN}
+ * tokens above it for the scenario's model. Reading `pad2.txt` then passes the threshold, and the
+ * context after compaction stays below it. Pi reads the settings when a session starts.
+ */
+async function armCompaction(prepared: Awaited<ReturnType<typeof prepareLive>>): Promise<number> {
+  const { options, sessionFile, settingsFile, errors } = prepared;
+  const run = runPrint(options, "Do not use any tools. Reply with only the word OK.");
+  const entries = await sessionEntries(sessionFile);
+  errors.printRun(run.stderr, messages(entries));
+  assert.equal(run.status, 0, `Pi exited with status ${String(run.status)}.`);
+  const usage = messages(entries).findLast((message) => message.role === "assistant")?.usage;
+  const baseline = usage ? calculateContextTokens(usage) : 0;
+  assert.ok(baseline > 0, `The first turn reports its context. Entries: ${outline(entries)}`);
+  await writeFile(
+    settingsFile,
+    JSON.stringify({
+      default: false,
+      models: { [`${options.provider}/${options.model}`]: { compactAt: baseline + ARMED_MARGIN } },
+    }),
+  );
+  return baseline;
+}
 
 const anthropicCompatSettings = {
   file: "pi-anthropic-compat.json",
@@ -388,6 +466,36 @@ for (const scenario of scenarios) {
           );
         }
       }
+      // `compact` is declared exactly in the requests that carry the compaction instruction.
+      const requests = toolProbes(entries);
+      const cycle = requests.filter((request) => request.entry < compactionIndex);
+      assert.ok(
+        cycle.some((request) => request.stages.includes("compact")),
+        `A probed request carried the compaction instruction. Entries: ${outline(entries)}`,
+      );
+      for (const request of cycle) {
+        assert.equal(
+          request.names.includes("compact"),
+          request.stages.includes("compact"),
+          `Declared ${JSON.stringify(request.names)} with stages ${JSON.stringify(request.stages)}.`,
+        );
+      }
+      const resumedRequest = requests.find((request) => request.entry > compactionIndex);
+      assert.ok(resumedRequest, `The resumed request was probed. Entries: ${outline(entries)}`);
+      assert.equal(
+        resumedRequest.names.includes("compact"),
+        false,
+        "Compaction withdraws compact.",
+      );
+      // Anthropic and Pi AI's Codex adapter add `compact` inside the conversation and keep the
+      // top-level tools of the request before. pi-openai-codex-compat sends the complete current
+      // tool set at the top level by design, so adding `compact` changes it.
+      const topLevelChange = scenario.compat === "pi-openai-codex-compat";
+      const added = cycle.findIndex((request) => request.names.includes("compact"));
+      const before = cycle[added - 1];
+      const first = cycle[added];
+      assert.ok(before && first, `A request preceded the one that added compact.`);
+      assert.deepEqual(first.top, topLevelChange ? [...before.top, "compact"] : before.top);
       const call = entries.findIndex(
         (entry) =>
           entry.type === "message" &&
@@ -444,7 +552,7 @@ for (const scenario of scenarios) {
         );
       }
       t.diagnostic(
-        `Pi ${piVersion} with ${scenario.compat ?? "no compat extension"}: ${scenario.compactOnly ? "the self-contained compact instruction" : "prepare and compact instructions"} reached ${scenario.provider}/${scenario.model} as mid-conversation ${scenario.role} items beside an unchanged ${found[0]?.systemLength ?? 0}-character top-level system prompt; the model compacted and resumed.`,
+        `Pi ${piVersion} with ${scenario.compat ?? "no compat extension"}: ${scenario.compactOnly ? "the self-contained compact instruction" : "prepare and compact instructions"} reached ${scenario.provider}/${scenario.model} as mid-conversation ${scenario.role} items beside an unchanged ${found[0]?.systemLength ?? 0}-character top-level system prompt; compact was declared only with the compaction instruction, ${topLevelChange ? "in the top-level tools" : "inside the conversation with unchanged top-level tools"}, and withdrawn after compaction; the model compacted and resumed.`,
       );
     },
   );
@@ -465,16 +573,20 @@ async function settledEntries(
 }
 
 /**
- * Each way an accepted request is cancelled, through the packaged CLI and a real model that the
- * user asks to compact. The fixture interrupts at the point a user or extension would.
+ * Each way an accepted request is cancelled, through the packaged CLI and a real model that
+ * reaches the compaction threshold. The fixture interrupts at the point a user or extension would.
  */
 const cancellations: { mode: CancelMode; notice: RegExp }[] = [
   { mode: "abort", notice: /did not run: The run was aborted\./ },
   { mode: "fail", notice: /did not run: Compaction cancelled/ },
 ];
 const cancellationScenario = scenarios[0];
+/**
+ * After {@link armCompaction}, reading `pad2.txt` passes `compactAt`, so the next request carries
+ * `compact` and the `[Compaction required]` instruction.
+ */
 const COMPACT_PROMPT =
-  "Do not read or write files. Call the compact tool now as your only tool call, with the message: Reply with only the word RESUMED.";
+  "Use the read tool to read pad2.txt. Do not write any files. Then follow the compaction instruction. When you call compact, use exactly this message: Reply with only the word RESUMED.";
 
 function hasCompactCall(entries: readonly SessionEntry[]): boolean {
   return entries.some(
@@ -491,9 +603,9 @@ for (const cancellation of cancellations) {
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
     async (t) => {
       assert.ok(cancellationScenario);
-      const { loaded, options, errors } = await prepareLive(t, cancellationScenario, {
-        cancel: cancellation.mode,
-      });
+      const prepared = await prepareLive(t, cancellationScenario, { cancel: cancellation.mode });
+      const { loaded, options, errors } = prepared;
+      await armCompaction(prepared);
       const client: RpcClient = new loaded.RpcClient(options);
       client.onEvent(errors.rpcEvent);
       t.after(async () => client.stop());
@@ -540,7 +652,8 @@ for (const cancellation of cancellations) {
 // The input does not conflict with the continuation, so the model can follow both.
 const HELD_INPUT = "Include the word READY in your next reply.";
 const holds = [
-  // Sent while the model writes its compact call, so the input is queued before the tool runs.
+  // Sent while the model writes its response after the read, which calls compact, so the input
+  // is queued before the tool runs.
   { when: "while the model calls compact", event: "message_start", send: "steer", held: false },
   { when: "during compaction", event: "compaction_start", send: "followUp", held: true },
 ] as const;
@@ -556,15 +669,19 @@ for (const hold of holds) {
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
     async (t) => {
       assert.ok(cancellationScenario);
-      const { loaded, options, errors } = await prepareLive(t, cancellationScenario);
+      const prepared = await prepareLive(t, cancellationScenario);
+      const { loaded, options, errors } = prepared;
+      await armCompaction(prepared);
       const client: RpcClient = new loaded.RpcClient(options);
       client.onEvent(errors.rpcEvent);
       t.after(async () => client.stop());
       await client.start();
       let sent: Promise<unknown> | undefined;
+      let read = false;
       client.onEvent((event) => {
+        if (event.type === "tool_execution_end" && event.toolName === "read") read = true;
         if (sent || event.type !== hold.event) return;
-        if (event.type === "message_start" && event.message.role !== "assistant") return;
+        if (event.type === "message_start" && (event.message.role !== "assistant" || !read)) return;
         sent = hold.send === "steer" ? client.steer(HELD_INPUT) : client.followUp(HELD_INPUT);
       });
       await client.promptAndWait(COMPACT_PROMPT, undefined, 240_000);
@@ -629,52 +746,6 @@ for (const hold of holds) {
     },
   );
 }
-
-/** compact is declared to an enabled model and hidden from the same model once disabled. */
-test(
-  "live packaged Pi CLI declares compact only to enabled models",
-  { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
-  async (t) => {
-    assert.ok(cancellationScenario);
-    const { provider, model } = cancellationScenario;
-    const { loaded, options, settingsFile, errors } = await prepareLive(t, cancellationScenario);
-    const declared: Record<string, string[]> = {};
-    for (const [label, settings] of [
-      ["enabled", { default: { compactAt: "99%" } }],
-      ["disabled", { models: { [`${provider}/${model}`]: false } }],
-    ] as const) {
-      await writeFile(settingsFile, JSON.stringify(settings));
-      const client: RpcClient = new loaded.RpcClient(options);
-      client.onEvent(errors.rpcEvent);
-      await client.start();
-      try {
-        await client.promptAndWait("Reply with only the word OK.", undefined, 120_000);
-        const { entries } = await client.getEntries();
-        const names = entries.flatMap((entry) =>
-          entry.type === "custom" &&
-          entry.customType === TOOLS_PROBE_TYPE &&
-          typeof entry.data === "object" &&
-          entry.data !== null &&
-          "names" in entry.data &&
-          Array.isArray(entry.data.names)
-            ? [entry.data.names.map(String)]
-            : [],
-        );
-        assert.ok(
-          names.length > 0,
-          `The ${label} request was probed. Entries: ${outline(entries)}`,
-        );
-        declared[label] = names.at(-1) ?? [];
-      } finally {
-        await client.stop();
-      }
-    }
-    assert.ok(declared["enabled"]?.includes("compact"), JSON.stringify(declared));
-    assert.equal(declared["disabled"]?.includes("compact"), false, JSON.stringify(declared));
-    assert.ok((declared["disabled"]?.length ?? 0) > 0, "Other tools stay declared.");
-    t.diagnostic(`Pi ${piVersion}: compact declared enabled=true, disabled=false.`);
-  },
-);
 
 /** The messages among session entries. */
 function messages(entries: readonly SessionEntry[]) {
@@ -751,29 +822,10 @@ for (const output of ["text", "json"] as const) {
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
     async (t) => {
       assert.ok(cancellationScenario);
-      const { options, sessionFile, errors } = await prepareLive(t, cancellationScenario);
-      const run = spawnSync(
-        process.execPath,
-        [
-          options.cliPath,
-          "--provider",
-          options.provider,
-          "--model",
-          options.model,
-          ...options.args,
-          ...(output === "json" ? ["--mode", "json"] : []),
-          "-p",
-          COMPACT_PROMPT,
-        ],
-        {
-          cwd: options.cwd,
-          env: { ...process.env, ...options.env },
-          encoding: "utf8",
-          timeout: 480_000,
-          maxBuffer: 64 * 1024 * 1024,
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-      );
+      const prepared = await prepareLive(t, cancellationScenario);
+      const { options, sessionFile, errors } = prepared;
+      await armCompaction(prepared);
+      const run = runPrint(options, COMPACT_PROMPT, output === "json" ? ["--mode", "json"] : []);
       const entries = await sessionEntries(sessionFile);
       errors.printRun(run.stderr, messages(entries));
       assert.equal(run.error, undefined, "Pi started and finished within the timeout.");
@@ -903,9 +955,9 @@ test(
   },
   async (t) => {
     assert.ok(cancellationScenario);
-    const { options, sessionFile, temporary, errors } = await prepareLive(t, cancellationScenario, {
-      hold: true,
-    });
+    const prepared = await prepareLive(t, cancellationScenario, { hold: true });
+    const { options, sessionFile, temporary, errors } = prepared;
+    await armCompaction(prepared);
     const tui = launchTui(t, options, COMPACT_PROMPT);
     try {
       await tui.until("compaction to start", () => existsSync(join(temporary, STARTED_FILE)));

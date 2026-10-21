@@ -128,7 +128,10 @@ test("prepareAt is optional", () => {
 test("instructions direct the model to a Markdown state file without context statistics", () => {
   const prepare = instructionText("prepare");
   assert.match(prepare, /^\[Compaction preparation\]\n/);
-  assert.match(prepare, /A `\[Compaction required\]` instruction will ask you to call `compact`/);
+  assert.match(
+    prepare,
+    /The `compact` tool becomes available with a `\[Compaction required\]` instruction, which asks you to call it/,
+  );
   assert.match(
     prepare,
     /Keep working\. Do not stop or wrap up early\. Compaction does not end the task/,
@@ -137,10 +140,7 @@ test("instructions direct the model to a Markdown state file without context sta
   assert.match(prepare, /- open questions for the user\n/);
   assert.match(prepare, /- Never stage or commit the state file\./);
   assert.match(prepare, /If you cannot or may not write files, skip the state file/);
-  assert.match(
-    prepare,
-    /Until `\[Compaction required\]` appears, call `compact` only if the user asks/,
-  );
+  assert.doesNotMatch(prepare, /user asks/);
   const compact = instructionText("compact");
   assert.match(compact, /^\[Compaction required\]\nAct now\./);
   assert.match(compact, /Update the state file so it records the current state/);

@@ -66,7 +66,7 @@ export function instructionText(kind: InstructionKind): string {
   if (kind === "prepare") {
     return [
       "[Compaction preparation]",
-      `The conversation will be compacted later. A \`[Compaction required]\` instruction will ask you to call \`${COMPACT_TOOL_NAME}\`.`,
+      `The conversation will be compacted later. The \`${COMPACT_TOOL_NAME}\` tool becomes available with a \`[Compaction required]\` instruction, which asks you to call it.`,
       `Keep working. Do not stop or wrap up early. ${CONTINUES}`,
       "",
       "Record the state in a Markdown state file now:",
@@ -76,8 +76,6 @@ export function instructionText(kind: InstructionKind): string {
       "State file rules:",
       ...list(FILE_RULES),
       `If you cannot or may not write files, skip the state file. Put the full state in \`message\` when you call \`${COMPACT_TOOL_NAME}\` later.`,
-      "",
-      `Until \`[Compaction required]\` appears, call \`${COMPACT_TOOL_NAME}\` only if the user asks.`,
     ].join("\n");
   }
   if (kind === "combined") {

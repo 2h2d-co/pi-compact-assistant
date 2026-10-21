@@ -9,6 +9,8 @@ import {
   fauxAssistantMessage,
   fauxToolCall,
   getCurrentSystemPrompt,
+  getCurrentTools,
+  getInitialSystemMessage,
   getSystemMessageText,
   type FauxResponseFactory,
   type Message,
@@ -42,14 +44,22 @@ function text(message: Message): string {
   return message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
 }
 
-/** Later system messages (index > 0) with their preceding message's text. */
+/**
+ * Later system messages (index > 0) that carry text, with their preceding message's text. Tool
+ * declaration changes are system messages without text.
+ */
 function laterSystemMessages(messages: readonly Message[]) {
   return messages.flatMap((message, index) => {
     const previous = messages[index - 1];
-    return previous && message.role === "system"
+    return previous && message.role === "system" && text(message)
       ? [{ text: text(message), after: text(previous).slice(0, 30) }]
       : [];
   });
+}
+
+/** Whether a request declares `compact`. */
+function declaresCompact(messages: readonly Message[]): boolean {
+  return getCurrentTools(messages).some((tool) => tool.name === "compact");
 }
 
 test("records each stage once and keeps its system message at a fixed position", async () => {
@@ -84,6 +94,13 @@ test("records each stage once and keeps its system message at a fixed position",
     // After a preparation instruction, the compaction instruction refers to its state file.
     assert.match(fourth[1]?.text ?? "", /Update the state file so it records the current state/);
     assert.match(fourth[1]?.after ?? "", /^fourth request/);
+    // `compact` is declared only with the compaction instruction, after the leading message.
+    assert.deepEqual(seen.map(declaresCompact), [false, false, false, true]);
+    const initial = getInitialSystemMessage(seen[3] ?? [])?.toolsAdded ?? [];
+    assert.equal(
+      initial.some((tool) => tool.name === "compact"),
+      false,
+    );
     // The instructions are later system messages. The leading system prompt stays unchanged.
     for (const request of seen) {
       const leading = request[0];
@@ -376,30 +393,126 @@ test("only supported providers and models receive instructions", async () => {
 });
 
 test("compact is declared only to supported models the settings enable", async () => {
+  /** Whether a session declares `compact` before and in a request past the threshold. */
   const declared = async (settings: unknown, options: RuntimeOptions = {}) => {
-    const { runtime, errors } = await testRuntime(settings, undefined, "print", false, options);
+    const { runtime, faux, errors } = await testRuntime(
+      settings,
+      undefined,
+      "print",
+      false,
+      options,
+    );
     try {
+      const before = runtime.session.getActiveToolNames().includes("compact");
+      let messages: Message[] = [];
+      faux.setResponses([
+        (context) => {
+          messages = context.messages;
+          return fauxAssistantMessage("ok");
+        },
+      ]);
+      await runtime.session.prompt(`large request ${filler(21000)}`);
       assert.deepEqual(errors, []);
-      return runtime.session.getActiveToolNames().includes("compact");
+      return [before, declaresCompact(messages)];
     } finally {
       await runtime.dispose();
     }
   };
-  assert.equal(await declared(SETTINGS), true);
+  assert.deepEqual(await declared(SETTINGS), [false, true]);
   // Unsupported models.
-  assert.equal(await declared(SETTINGS, { provider: "opencode" }), false);
-  assert.equal(await declared(SETTINGS, { midConversation: false }), false);
+  assert.deepEqual(await declared(SETTINGS, { provider: "opencode" }), [false, false]);
+  assert.deepEqual(await declared(SETTINGS, { midConversation: false }), [false, false]);
   // Disabled models, including an invalid settings file, which disables every model.
-  assert.equal(await declared({ default: false }), false);
-  assert.equal(await declared({ models: { "anthropic/faux-1": false } }), false);
-  assert.equal(await declared({ enabled: false }), false);
-  assert.equal(await declared({ default: "bad" }), false);
+  assert.deepEqual(await declared({ default: false }), [false, false]);
+  assert.deepEqual(await declared({ models: { "anthropic/faux-1": false } }), [false, false]);
+  assert.deepEqual(await declared({ enabled: false }), [false, false]);
+  assert.deepEqual(await declared({ default: "bad" }), [false, false]);
+});
+
+test("compact stays undeclared below compactAt, including after the preparation instruction", async () => {
+  const { runtime, faux, errors } = await testRuntime(SETTINGS);
+  try {
+    const seen: Message[][] = [];
+    const record: FauxResponseFactory = (context) => {
+      seen.push(context.messages);
+      return fauxAssistantMessage("ok");
+    };
+    faux.setResponses([record, record]);
+    await runtime.session.prompt("first small request");
+    await runtime.session.prompt(`second request ${filler(3500)}`);
+    assert.match(laterSystemMessages(seen[1] ?? [])[0]?.text ?? "", /^\[Compaction preparation\]/);
+    assert.deepEqual(seen.map(declaresCompact), [false, false]);
+    assert.equal(runtime.session.getActiveToolNames().includes("compact"), false);
+    assert.deepEqual(errors, []);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("a message that passes compactAt after the tool batch delays the instruction one request", async () => {
+  const { runtime, faux, errors } = await testRuntime({ default: { compactAt: 20000 } }, (pi) => {
+    pi.registerTool({
+      name: "queue_large",
+      label: "Queue large",
+      description: "Queue a large steering message",
+      parameters: Type.Object({}),
+      execute: () => {
+        // Steering arrives after the tool batch ends, so only the request sees its tokens.
+        pi.sendUserMessage(`large steering ${filler(21000)}`, { deliverAs: "steer" });
+        return Promise.resolve({ content: [{ type: "text", text: "queued" }], details: undefined });
+      },
+    });
+  });
+  try {
+    const seen: Message[][] = [];
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("queue_large", {})),
+      (context) => {
+        seen.push(context.messages);
+        return fauxAssistantMessage(fauxToolCall("queue_large", {}));
+      },
+      (context) => {
+        seen.push(context.messages);
+        return fauxAssistantMessage("done");
+      },
+    ]);
+    await runtime.session.prompt("queue it");
+    // The first request past compactAt has no `compact`, so it gets no instruction that asks
+    // for it. The tool and the instruction arrive together with the next request.
+    assert.deepEqual(laterSystemMessages(seen[0] ?? []), []);
+    assert.equal(declaresCompact(seen[0] ?? []), false);
+    const next = laterSystemMessages(seen[1] ?? []);
+    assert.equal(next.length, 1);
+    assert.match(next[0]?.text ?? "", /^\[Compaction required\]/);
+    assert.equal(declaresCompact(seen[1] ?? []), true);
+    assert.deepEqual(errors, []);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("any compaction withdraws compact", async () => {
+  const { runtime, faux, errors } = await testRuntime(SETTINGS);
+  try {
+    faux.setResponses([fauxAssistantMessage("ok"), fauxAssistantMessage("ok")]);
+    await runtime.session.prompt(`large request ${filler(21000)}`);
+    await runtime.session.prompt(`second request ${filler(300)}`);
+    assert.equal(runtime.session.getActiveToolNames().includes("compact"), true);
+    faux.setResponses([fauxAssistantMessage("Summary: the large request was handled.")]);
+    await runtime.session.compact();
+    assert.equal(runtime.session.getActiveToolNames().includes("compact"), false);
+    assert.deepEqual(errors, []);
+  } finally {
+    await runtime.dispose();
+  }
 });
 
 test("switching models hides compact and declares it again", async () => {
   const { runtime, faux, errors } = await testRuntime(SETTINGS);
   try {
     const declared = () => runtime.session.getActiveToolNames().includes("compact");
+    faux.setResponses([fauxAssistantMessage("ok")]);
+    await runtime.session.prompt(`large request ${filler(21000)}`);
     assert.equal(declared(), true);
     const folding = faux.getModel(FOLDING_MODEL_ID);
     assert.ok(folding);
@@ -519,6 +632,8 @@ test("the compact tool compacts, then delivers its message and resumes", async (
       /not a new user request and grants no additional authorization/,
     );
     assert.deepEqual(laterSystemMessages(resumed), []);
+    assert.equal(declaresCompact(resumed), false);
+    assert.equal(runtime.session.getActiveToolNames().includes("compact"), false);
     assert.deepEqual(activeInstructions(branch), []);
     assert.match(resumedPrompt, new RegExp(SYSTEM_INSTRUCTIONS));
     assert.deepEqual(errors, []);
@@ -541,7 +656,7 @@ test("the compact tool must be the only tool call", async () => {
         return fauxAssistantMessage("Understood");
       },
     ]);
-    await runtime.session.prompt("compact");
+    await runtime.session.prompt(`compact ${filler(21000)}`);
     await runtime.session.waitForIdle();
     assert.match(results, /Call compact alone/);
     assert.equal(
@@ -562,7 +677,7 @@ test("an aborted run cancels the accepted request and tells the model", async ()
   });
   try {
     faux.setResponses([fauxAssistantMessage(fauxToolCall("compact", { message: "Continue" }))]);
-    await runtime.session.prompt("compact");
+    await runtime.session.prompt(`compact ${filler(21000)}`);
     await runtime.session.waitForIdle();
     const branch = runtime.session.sessionManager.getBranch();
     assert.equal(
@@ -603,9 +718,8 @@ async function interruptedRequest(
   { ui = false, settle = "notice" }: { ui?: boolean; settle?: "notice" | "continuation" } = {},
 ) {
   let current: (() => AgentSession) | undefined;
-  // A threshold the test never reaches keeps compact declared without instructions.
   const runtime = await testRuntime(
-    { default: { compactAt: "99%" } },
+    { default: { compactAt: 20000 } },
     (pi) => {
       interrupt(pi, () => {
         assert.ok(current);

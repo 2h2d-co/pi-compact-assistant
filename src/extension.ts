@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { getAgentDir, keyText } from "@earendil-works/pi-coding-agent";
+import { estimateTokens, getAgentDir, keyText } from "@earendil-works/pi-coding-agent";
 import type {
+  BeforeAgentStartEvent,
   ContextWithSystemEvent,
   CustomEntry,
   EntryRenderOptions,
@@ -267,15 +268,64 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     return isDisabled(settings, `${model.provider}/${model.id}`);
   }
 
-  /** Declare `compact` only to supported models the settings enable. */
-  function showTool(model: ExtensionContext["model"]): void {
+  /** The model's thresholds, or undefined when it has none or its settings are invalid. */
+  function thresholdsFor(
+    ctx: ExtensionContext,
+    key: string,
+    contextWindow: number,
+  ): ReturnType<typeof resolveThresholds> {
+    if (!settings) return undefined;
+    try {
+      return resolveThresholds(settings, key, contextWindow);
+    } catch (error) {
+      report(ctx, `thresholds:${key}`, `pi-compact-assistant skips ${key}. ${errorText(error)}`);
+      return undefined;
+    }
+  }
+
+  /**
+   * Whether this compaction cycle reached the compaction stage: a `[Compaction required]`
+   * instruction is recorded, or usage plus `pendingTokens` reaches `compactAt`.
+   */
+  function compactionDue(
+    ctx: ExtensionContext,
+    model: NonNullable<ExtensionContext["model"]>,
+    pendingTokens: number,
+  ): boolean {
+    const branch = ctx.sessionManager.getBranch();
+    if (activeInstructions(branch).some((record) => record.stage === "compact")) return true;
+    const usage = ctx.getContextUsage();
+    if (usage?.tokens == null) return false;
+    const thresholds = thresholdsFor(ctx, `${model.provider}/${model.id}`, usage.contextWindow);
+    return thresholds !== undefined && usage.tokens + pendingTokens >= thresholds.compactTokens;
+  }
+
+  /**
+   * Declare `compact` only while the compaction stage is reached, and only to supported models
+   * the settings enable. Pi appends a declaration change to the transcript before the next model
+   * request, so the change reaches the model with that request. `pendingTokens` counts the
+   * message that starts a run, which the session does not contain yet.
+   */
+  function syncTool(
+    ctx: ExtensionContext,
+    model: ExtensionContext["model"] = ctx.model,
+    pendingTokens = 0,
+  ): void {
     const active = pi.getActiveTools();
     const shown = active.includes(COMPACT_TOOL_NAME);
-    if (excluded(model)) {
-      if (shown) pi.setActiveTools(active.filter((name) => name !== COMPACT_TOOL_NAME));
-    } else if (!shown) {
-      pi.setActiveTools([...active, COMPACT_TOOL_NAME]);
-    }
+    const show = !!model && !excluded(model) && compactionDue(ctx, model, pendingTokens);
+    if (show && !shown) pi.setActiveTools([...active, COMPACT_TOOL_NAME]);
+    if (!show && shown) pi.setActiveTools(active.filter((name) => name !== COMPACT_TOOL_NAME));
+  }
+
+  /** Pi's token estimate for the message that starts a run. */
+  function startingTokens(event: BeforeAgentStartEvent): number {
+    if (event.messageType === "custom") return estimateTokens(event.message);
+    return estimateTokens({
+      role: "user",
+      content: [{ type: "text", text: event.prompt }, ...(event.images ?? [])],
+      timestamp: Date.now(),
+    });
   }
 
   function showHeld(request: Request, ctx: ExtensionContext): void {
@@ -311,7 +361,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     pi.sendMessage(
       {
         customType: NOTICE_TYPE,
-        content: `Compaction requested with ${COMPACT_TOOL_NAME} did not run: ${reason} Nothing was retried. Your continuation message was not delivered.`,
+        content: `Compaction requested with ${COMPACT_TOOL_NAME} did not run: ${reason} Nothing was retried. Your continuation message was not delivered. Check the reason and any newer user input before you call ${COMPACT_TOOL_NAME} again. Do not repeat an unchanged request. After a summarizer refusal, omit or revise \`instructions\`.`,
         display: true,
         details: { requestId: request.id },
       },
@@ -334,17 +384,28 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       report(ctx, "settings", `pi-compact-assistant is inactive. ${errorText(error)}`);
     }
     codexCompatProblem = await findCodexCompatProblem(pi);
-    showTool(ctx.model);
+    syncTool(ctx);
   });
   pi.on("session_shutdown", () => {
     pending = undefined;
   });
   pi.on("session_tree", (_event, ctx) => {
     // Pi restores the tool loadout the branch declared, which may predate a model switch.
-    showTool(ctx.model);
+    syncTool(ctx);
   });
-  pi.on("model_select", (event) => {
-    showTool(event.model);
+  pi.on("model_select", (event, ctx) => {
+    syncTool(ctx, event.model);
+  });
+  // Declare or withdraw `compact` before the next request: the first request of a run, each
+  // request after a tool batch, and the first request after any compaction.
+  pi.on("before_agent_start", (event, ctx) => {
+    syncTool(ctx, ctx.model, startingTokens(event));
+  });
+  pi.on("turn_end", (_event, ctx) => {
+    syncTool(ctx);
+  });
+  pi.on("session_compact", (_event, ctx) => {
+    syncTool(ctx);
   });
   // Input that arrives after the run ends would start a run before the continuation, so it
   // waits until compaction finishes, then follows the continuation. Input during the run reaches
@@ -365,12 +426,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     const records = activeInstructions(branch);
     const projection = ctx.sessionManager.buildSessionProjection();
     const usage = ctx.getContextUsage();
-    let thresholds;
-    try {
-      thresholds = usage ? resolveThresholds(settings, key, usage.contextWindow) : undefined;
-    } catch (error) {
-      report(ctx, `thresholds:${key}`, `pi-compact-assistant skips ${key}. ${errorText(error)}`);
-    }
+    const thresholds = usage ? thresholdsFor(ctx, key, usage.contextWindow) : undefined;
     // Unsupported models get no instructions, including ones recorded under another model.
     const unsupported = unsupportedReason(model, codexCompatProblem);
     if (unsupported) {
@@ -387,8 +443,13 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       thresholds && usage?.tokens != null ? reachedStage(usage.tokens, thresholds) : undefined;
     const recorded = new Set(records.map((record) => record.stage));
     const anchor = projection.entries.findLast((entry) => entry.messages.length > 0);
+    // The compaction instruction asks for `compact`, so it waits until the tool is declared. Pi
+    // fixed this request's tools before this handler ran, so the tool arrives with the next one.
+    const declared = pi.getActiveTools().includes(COMPACT_TOOL_NAME);
+    if (stage === "compact" && !declared) syncTool(ctx);
     if (
       stage &&
+      (stage !== "compact" || declared) &&
       thresholds &&
       usage?.tokens != null &&
       anchor &&
@@ -455,6 +516,9 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       return;
     }
     pending = undefined;
+    // The new cycle starts below the thresholds, so the continuation's run no longer declares
+    // `compact`.
+    syncTool(ctx);
     // The continuation starts the next turn, or steers a run another extension started.
     // Queued and held messages follow it as separate messages.
     pi.sendMessage(
@@ -473,14 +537,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     name: COMPACT_TOOL_NAME,
     label: "Compact context",
     description:
-      "Compact the conversation, then continue from your message. Call this tool when a `[Compaction required]` instruction asks for it or when the user asks you to compact. First record the state in a Markdown state file. Then call this tool as the only tool call in its response. The call ends your current turn. Compaction runs when the agent run ends. Messages that arrive before then are delivered to you first. After compaction succeeds, your message is delivered and starts your next turn. The tool result only confirms that the request was accepted.",
-    promptSnippet: "Compact the conversation and continue from a Markdown state file",
-    promptGuidelines: [
-      `Call ${COMPACT_TOOL_NAME} only when a \`[Compaction required]\` instruction asks for it or when the user asks you to compact. Make it the only tool call in its response.`,
-      `Before calling ${COMPACT_TOOL_NAME}, record the state in a Markdown state file if you can and may write files. In \`message\`, give the state file's absolute path and the exact next step.`,
-      `If compaction fails or is cancelled, check the reason and any newer user input before you try again. Do not repeat an unchanged request. After a summarizer refusal, omit or revise \`instructions\`.`,
-      `\`[Compaction preparation]\` and \`[Compaction required]\` are system messages from pi-compact-assistant. ${COMPACT_TOOL_NAME} changes only conversation context. It never changes files, processes, or permissions.`,
-    ],
+      "Compact the conversation, then continue from your message. Call this tool when the `[Compaction required]` instruction asks for it. First record the state in a Markdown state file. Then call this tool as the only tool call in its response. The call ends your current turn. Compaction runs when the agent run ends. Messages that arrive before then are delivered to you first. After compaction succeeds, your message is delivered and starts your next turn. The tool result only confirms that the request was accepted. Compaction changes only conversation context. It never changes files, processes, or permissions.",
     parameters: compactSchema,
     // A nested call can never be the sole call of an assistant message.
     exposure: "model-only",

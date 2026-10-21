@@ -6,8 +6,9 @@ automatic compaction interrupts it.
 - It checks context usage before every model request, including requests between tool calls.
 - At a **preparation threshold**, it tells the model to keep working and to record the work's
   state in a Markdown file.
-- At a **compaction threshold**, it tells the model to update that file now, then call the
-  **`compact`** tool with the file's path and the next step.
+- At a **compaction threshold**, it declares the **`compact`** tool and tells the model to update
+  that file now, then call `compact` with the file's path and the next step. Before that
+  threshold and after each compaction, the model has no `compact` tool.
 - `compact` runs Pi's compaction after the turn ends, then delivers the model's continuation
   message and resumes the agent.
 
@@ -104,8 +105,7 @@ decisions, changed files, validation results, running processes, open questions,
 a Markdown state file and updates it when the state changes materially. It reuses the task's
 state file or creates one where project instructions keep working notes, or outside tracked
 files. It never puts the state in project documentation and never stages or commits the file.
-Until the `[Compaction required]` instruction appears, it calls `compact` only at the user's
-request.
+The model has no `compact` tool yet.
 
 `[Compaction required]` tells the model to act now: finish only a half-applied change, update the
 state file, then call `compact` as the only tool call in its response, with the file's absolute
@@ -138,9 +138,37 @@ skipped silently.
 The `compact` tool is declared only to supported models that the settings enable. Unsupported
 models and disabled models do not get it. A model is disabled when its entry under `models` is
 `false`, when it has no entry and `default` is `false`, when `enabled` is `false`, or when the
-settings file is invalid. The extension updates the tool set when a session starts, the model
-changes, or the session branch changes. A model that does not get the tool cannot compact, even
-at the user's request.
+settings file is invalid.
+
+### When `compact` is declared
+
+The extension declares `compact` only while the compaction stage is reached: context usage is at
+`compactAt`, or a `[Compaction required]` instruction is recorded since the latest compaction.
+Any compaction withdraws it, including Pi's automatic compaction and `/compact`. The model cannot
+compact at the user's request before the threshold.
+
+The extension updates the declaration before each model request: when a run starts, counting the
+message that starts it, after each tool batch, and after each compaction. It also updates it when
+a session starts, the model changes, or the session branch changes. Pi appends the change to the
+transcript, so the tool reaches the model with the same request as the `[Compaction required]`
+instruction:
+
+- Anthropic models that accept mid-conversation tool changes receive an inline
+  `tool_definition`. The request's top-level `tools` field keeps the first request's tools, so
+  the cached prefix stays valid.
+- Pi's built-in Codex provider adds the tool with an `additional_tools` item in place in the
+  conversation, and the top-level `tools` field stays unchanged.
+- `pi-openai-codex-compat` sends the complete current tool set in the top-level `tools` field on
+  every request. Adding `compact` costs one prompt-cache miss, at the request that carries the
+  compaction instruction.
+
+`compact` has no system prompt guidelines, so declaring it leaves the system prompt unchanged.
+The instructions and the tool description carry its guidance.
+
+A message that arrives after a tool batch, such as a large steering message, can pass
+`compactAt` after the extension updated the declaration for the next request. That request then
+gets no `[Compaction required]` instruction, because it cannot call `compact`. The extension
+declares the tool, and the instruction follows with the next request.
 
 ## `compact`
 
@@ -187,7 +215,10 @@ The request is cancelled, and the model is told, when:
 - the run is aborted; or
 - compaction fails or another extension cancels it.
 
-After a cancellation, held input follows the notice as separate messages.
+After a cancellation, held input follows the notice as separate messages. The notice tells the
+model to check the reason and any newer user input before it calls `compact` again, and to omit
+or revise `instructions` after a summarizer refusal. `compact` stays declared until a compaction
+succeeds.
 
 Cancelled requests are never retried or replayed. `compact` changes conversation context only,
 never files, processes, or permissions.
@@ -220,17 +251,20 @@ npm run pack:dry
 uses your Pi login through an isolated agent directory, loads the pinned system prompt patcher and
 the provider's compat extension, and checks that both instructions reach the provider payload as
 mid-conversation items beside an unchanged top-level system prompt, the model calls `compact`,
-compaction runs, and the agent resumes with earlier facts intact. Further scenarios ask the model
-to compact, then abort the run or cancel the compaction, and check that the continuation is
-withheld with a notice. Two more send user input through RPC while the model
+compaction runs, and the agent resumes with earlier facts intact. They also check that the
+provider payload declares `compact` only in requests that carry the compaction instruction,
+that compaction withdraws it, and that the top-level `tools` field stays unchanged except with
+`pi-openai-codex-compat`. Further scenarios first measure the context after a small turn and set
+`compactAt` above it, so reading a padding file passes the threshold. The model then calls
+`compact`, and the test aborts the run or cancels the compaction and checks that the continuation
+is withheld with a notice. Two more send user input through RPC while the model
 calls `compact` and during compaction. They check that compaction still runs, that the first input
 reaches the model before compaction, and that the second follows the continuation as its own
 message. Print runs in text and JSON mode must compact and answer the continuation before they
 exit. An interactive TUI run, in a pseudo-terminal from the operating system's `script` utility
 on macOS or Linux, types input during compaction and checks that it follows the continuation.
 A second TUI run checks that a recorded instruction appears in the transcript as a box.
-Another checks that the provider payload declares `compact` to an enabled model and removes it
-once the model is disabled. Release validation runs it against the exact release archive.
+Release validation runs it against the exact release archive.
 
 ## Packaging
 
