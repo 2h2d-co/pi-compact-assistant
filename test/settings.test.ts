@@ -3,60 +3,63 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { instructionText, reachedStage } from "../src/instructions.ts";
+import { instructionText } from "../src/instructions.ts";
 import {
   DEFAULT_SETTINGS,
   SETTINGS_FILE_NAME,
   loadSettings,
   parseSettings,
-  resolveThresholds,
+  resolveCompactTokens,
 } from "../src/settings.ts";
 
-test("omitted settings use 70% and 80% of the context window", () => {
+test("omitted settings compact at 80% of the context window", () => {
   assert.deepEqual(parseSettings({}), DEFAULT_SETTINGS);
-  assert.deepEqual(resolveThresholds(DEFAULT_SETTINGS, "anthropic/claude-opus-5-5", 1_000_000), {
-    prepareTokens: 700_000,
-    compactTokens: 800_000,
-  });
+  assert.equal(
+    resolveCompactTokens(DEFAULT_SETTINGS, "anthropic/claude-opus-5-5", 1_000_000),
+    800_000,
+  );
 });
 
 test("exact model entries override the default with tokens or percentages", () => {
   const settings = parseSettings({
-    default: { prepareAt: "50%", compactAt: "60.5%" },
+    default: { compactAt: "60.5%" },
     models: {
-      "anthropic/claude-opus-5-5": { prepareAt: 450_000, compactAt: 500_000 },
+      "anthropic/claude-opus-5-5": { compactAt: 500_000 },
       "openai-codex/gpt-6.1-sol": false,
     },
   });
-  assert.deepEqual(resolveThresholds(settings, "anthropic/claude-opus-5-5", 1_000_000), {
-    prepareTokens: 450_000,
-    compactTokens: 500_000,
-  });
-  assert.equal(resolveThresholds(settings, "openai-codex/gpt-6.1-sol", 272_000), undefined);
-  assert.deepEqual(resolveThresholds(settings, "openai-codex/gpt-6-astra", 272_000), {
-    prepareTokens: 136_000,
-    compactTokens: 164_560,
-  });
+  assert.equal(resolveCompactTokens(settings, "anthropic/claude-opus-5-5", 1_000_000), 500_000);
+  assert.equal(resolveCompactTokens(settings, "openai-codex/gpt-6.1-sol", 272_000), undefined);
+  assert.equal(resolveCompactTokens(settings, "openai-codex/gpt-6-astra", 272_000), 164_560);
   // Model keys are exact and case-sensitive.
-  assert.deepEqual(resolveThresholds(settings, "anthropic/Claude-Opus-5-5", 1_000_000), {
-    prepareTokens: 500_000,
-    compactTokens: 605_000,
-  });
+  assert.equal(resolveCompactTokens(settings, "anthropic/Claude-Opus-5-5", 1_000_000), 605_000);
 });
 
 test("disabled settings and a false default skip unlisted models", () => {
   assert.equal(
-    resolveThresholds(parseSettings({ enabled: false }), "faux/faux-1", 100_000),
+    resolveCompactTokens(parseSettings({ enabled: false }), "faux/faux-1", 100_000),
     undefined,
   );
   const listedOnly = parseSettings({
     default: false,
-    models: { "faux/faux-1": { prepareAt: 10, compactAt: 20 } },
+    models: { "faux/faux-1": { compactAt: 20 } },
   });
-  assert.equal(resolveThresholds(listedOnly, "faux/other", 100_000), undefined);
-  assert.deepEqual(resolveThresholds(listedOnly, "faux/faux-1", 100_000), {
-    prepareTokens: 10,
-    compactTokens: 20,
+  assert.equal(resolveCompactTokens(listedOnly, "faux/other", 100_000), undefined);
+  assert.equal(resolveCompactTokens(listedOnly, "faux/faux-1", 100_000), 20);
+});
+
+test("prepareAt from earlier versions is ignored, whatever its value", () => {
+  const settings = parseSettings({
+    default: { prepareAt: "70%", compactAt: "80%" },
+    models: {
+      "a/b": { prepareAt: 600_000, compactAt: 500_000 },
+      "a/c": { prepareAt: "bad", compactAt: 10 },
+    },
+  });
+  assert.deepEqual(settings, {
+    enabled: true,
+    default: { compactAt: "80%" },
+    models: { "a/b": { compactAt: 500_000 }, "a/c": { compactAt: 10 } },
   });
 });
 
@@ -65,31 +68,20 @@ test("rejects invalid documents with the failing setting named", () => {
     [[], /JSON object/],
     [{ enable: true }, /enable is not a setting/],
     [{ enabled: "yes" }, /enabled must be true or false/],
-    [{ default: { prepareAt: 0, compactAt: 10 } }, /default\.prepareAt must be/],
-    [{ default: { prepareAt: 1.5, compactAt: 10 } }, /default\.prepareAt must be/],
-    [{ default: { prepareAt: "100%", compactAt: "90%" } }, /default\.prepareAt must be/],
-    [{ default: { prepareAt: "70", compactAt: "90%" } }, /default\.prepareAt must be/],
+    [{ default: { compactAt: 0 } }, /default\.compactAt must be/],
+    [{ default: { compactAt: 1.5 } }, /default\.compactAt must be/],
+    [{ default: { compactAt: "100%" } }, /default\.compactAt must be/],
+    [{ default: { compactAt: "70" } }, /default\.compactAt must be/],
     [{ default: { prepareAt: 10 } }, /default\.compactAt must be/],
-    [{ default: { prepareAt: null, compactAt: 10 } }, /default\.prepareAt must be/],
-    [{ default: { prepareAt: 10, compactAt: 20, keep: 1 } }, /default\.keep is not a setting/],
-    [{ default: true }, /default must be an object/],
+    [{ default: { compactAt: null } }, /default\.compactAt must be/],
+    [{ default: { compactAt: 20, keep: 1 } }, /default\.keep is not a setting\. Use compactAt\./],
+    [{ default: true }, /default must be an object with compactAt, or false/],
     [{ models: [] }, /models must be an object/],
     [{ models: { "claude-opus-5-5": false } }, /exact "provider\/modelId"/],
   ];
   for (const [value, message] of cases) {
     assert.throws(() => parseSettings(value), { message }, JSON.stringify(value));
   }
-});
-
-test("compactAt must resolve above prepareAt for the active window", () => {
-  const settings = parseSettings({ default: { prepareAt: 300_000, compactAt: "50%" } });
-  assert.deepEqual(resolveThresholds(settings, "a/b", 1_000_000), {
-    prepareTokens: 300_000,
-    compactTokens: 500_000,
-  });
-  assert.throws(() => resolveThresholds(settings, "a/b", 272_000), {
-    message: "prepareAt (300000 tokens) must be below compactAt (136000 tokens) for a/b.",
-  });
 });
 
 test("loads the settings file and reports invalid JSON with its path", async () => {
@@ -103,63 +95,23 @@ test("loads the settings file and reports invalid JSON with its path", async () 
   });
 });
 
-test("selects the highest reached stage", () => {
-  const thresholds = { prepareTokens: 450_000, compactTokens: 500_000 };
-  assert.equal(reachedStage(449_999, thresholds), undefined);
-  assert.equal(reachedStage(450_000, thresholds), "prepare");
-  assert.equal(reachedStage(500_000, thresholds), "compact");
-  // Without a preparation threshold, only the compaction stage exists.
-  assert.equal(reachedStage(499_999, { compactTokens: 500_000 }), undefined);
-  assert.equal(reachedStage(500_000, { compactTokens: 500_000 }), "compact");
-});
-
-test("prepareAt is optional", () => {
-  const settings = parseSettings({
-    default: { compactAt: "80%" },
-    models: { "anthropic/claude-opus-5-5": { compactAt: 500_000 } },
-  });
-  assert.deepEqual(settings.models["anthropic/claude-opus-5-5"], { compactAt: 500_000 });
-  assert.deepEqual(resolveThresholds(settings, "anthropic/claude-opus-5-5", 1_000_000), {
-    compactTokens: 500_000,
-  });
-  assert.deepEqual(resolveThresholds(settings, "a/b", 100_000), { compactTokens: 80_000 });
-});
-
-test("instructions direct the model to a Markdown state file without context statistics", () => {
-  const prepare = instructionText("prepare");
-  assert.match(prepare, /^\[Compaction preparation\]\n/);
+test("the instruction directs the model to a Markdown state file without context statistics", () => {
+  const text = instructionText();
+  assert.match(text, /^\[Compaction required\]\nThe conversation must be compacted now\./);
+  assert.match(text, /Compaction does not end the task/);
   assert.match(
-    prepare,
-    /The `compact` tool becomes available with a `\[Compaction required\]` instruction, which asks you to call it/,
-  );
-  assert.match(
-    prepare,
-    /Keep working\. Do not stop or wrap up early\. Compaction does not end the task/,
-  );
-  assert.match(prepare, /Record the state in a Markdown state file now:\n- the user's goal/);
-  assert.match(prepare, /- open questions for the user\n/);
-  assert.match(prepare, /- Never stage or commit the state file\./);
-  assert.match(prepare, /If you cannot or may not write files, skip the state file/);
-  assert.doesNotMatch(prepare, /user asks/);
-  const compact = instructionText("compact");
-  assert.match(compact, /^\[Compaction required\]\nAct now\./);
-  assert.match(compact, /Update the state file so it records the current state/);
-  assert.match(compact, /under the state file rules in `\[Compaction preparation\]`/);
-  const combined = instructionText("combined");
-  assert.match(combined, /^\[Compaction required\]\nThe conversation must be compacted now\./);
-  assert.match(
-    combined,
+    text,
     /1\. Record the current state in a Markdown state file:\n {3}- the user's goal/,
   );
-  assert.match(combined, / {3}- Never stage or commit the state file\./);
-  assert.doesNotMatch(combined, /Compaction preparation|Update the state file/);
-  for (const text of [compact, combined]) {
-    assert.match(text, /2\. After the write succeeds, or if you skipped step 1, call `compact`/);
-    assert.match(
-      text,
-      /`message` \(required\).*Give the state file's absolute path and the exact next step/,
-    );
-    assert.match(text, /If no work is pending, say so/);
-  }
-  for (const text of [prepare, compact, combined]) assert.doesNotMatch(text, /tokens|%/);
+  assert.match(text, / {3}- open questions for the user\n/);
+  assert.match(text, / {3}- Never stage or commit the state file\./);
+  assert.match(text, /If you cannot or may not write files, skip this step/);
+  assert.match(text, /2\. After the write succeeds, or if you skipped step 1, call `compact`/);
+  assert.match(
+    text,
+    /`message` \(required\).*Give the state file's absolute path and the exact next step/,
+  );
+  assert.match(text, /If no work is pending, say so/);
+  assert.doesNotMatch(text, /preparation/i);
+  assert.doesNotMatch(text, /tokens|%/);
 });

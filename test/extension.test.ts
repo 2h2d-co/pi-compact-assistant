@@ -34,7 +34,7 @@ import {
   type RuntimeOptions,
 } from "./support/runtime.ts";
 
-const SETTINGS = { default: { prepareAt: 3000, compactAt: 20000 } };
+const SETTINGS = { default: { compactAt: 20000 } };
 
 function text(message: Message): string {
   if (message.role === "assistant") {
@@ -45,14 +45,14 @@ function text(message: Message): string {
 }
 
 /**
- * Later system messages (index > 0) that carry text, with their preceding message's text. Tool
- * declaration changes are system messages without text.
+ * Later system messages (index > 0) that carry text, with the text of the nearest earlier
+ * message that has text. Tool declaration changes are system messages without text.
  */
 function laterSystemMessages(messages: readonly Message[]) {
   return messages.flatMap((message, index) => {
-    const previous = messages[index - 1];
-    return previous && message.role === "system" && text(message)
-      ? [{ text: text(message), after: text(previous).slice(0, 30) }]
+    const previous = messages.slice(0, index).findLast((earlier) => text(earlier));
+    return index > 0 && message.role === "system" && text(message)
+      ? [{ text: text(message), after: (previous ? text(previous) : "").slice(0, 30) }]
       : [];
   });
 }
@@ -62,7 +62,7 @@ function declaresCompact(messages: readonly Message[]): boolean {
   return getCurrentTools(messages).some((tool) => tool.name === "compact");
 }
 
-test("records each stage once and keeps its system message at a fixed position", async () => {
+test("records the instruction once and keeps its system message at a fixed position", async () => {
   const { runtime, faux, errors } = await testRuntime(SETTINGS);
   try {
     const seen: Message[][] = [];
@@ -71,31 +71,26 @@ test("records each stage once and keeps its system message at a fixed position",
       return fauxAssistantMessage("ok");
     };
     faux.setResponses([record, record, record, record]);
-    await runtime.session.prompt("first small request");
-    await runtime.session.prompt(`second request ${filler(3500)}`);
-    await runtime.session.prompt("third small request");
-    await runtime.session.prompt(`fourth request ${filler(20000)}`);
+    await runtime.session.prompt(`first request ${filler(3500)}`);
+    await runtime.session.prompt("second small request");
+    await runtime.session.prompt(`third request ${filler(20000)}`);
+    await runtime.session.prompt("fourth small request");
 
+    // Below compactAt, requests carry no instruction.
     assert.deepEqual(laterSystemMessages(seen[0] ?? []), []);
-    const second = laterSystemMessages(seen[1] ?? []);
-    assert.equal(second.length, 1);
-    assert.match(second[0]?.text ?? "", /^\[Compaction preparation\]/);
-    assert.match(second[0]?.after ?? "", /^second request/);
-    // The prepare instruction stays directly after the message it was anchored to.
-    assert.deepEqual(laterSystemMessages(seen[2] ?? []), second);
-    const fourth = laterSystemMessages(seen[3] ?? []);
-    assert.equal(fourth.length, 2);
-    assert.deepEqual(fourth[0], second[0]);
-    assert.match(fourth[1]?.text ?? "", /^\[Compaction required\]/);
+    assert.deepEqual(laterSystemMessages(seen[1] ?? []), []);
+    const third = laterSystemMessages(seen[2] ?? []);
+    assert.equal(third.length, 1);
+    assert.match(third[0]?.text ?? "", /^\[Compaction required\]/);
     assert.match(
-      fourth[1]?.text ?? "",
+      third[0]?.text ?? "",
       /call `compact`\. Make it the only tool call in its response/,
     );
-    // After a preparation instruction, the compaction instruction refers to its state file.
-    assert.match(fourth[1]?.text ?? "", /Update the state file so it records the current state/);
-    assert.match(fourth[1]?.after ?? "", /^fourth request/);
-    // `compact` is declared only with the compaction instruction, after the leading message.
-    assert.deepEqual(seen.map(declaresCompact), [false, false, false, true]);
+    assert.match(third[0]?.after ?? "", /^third request/);
+    // The instruction stays directly after the message it was anchored to.
+    assert.deepEqual(laterSystemMessages(seen[3] ?? []), third);
+    // `compact` is declared only with the instruction, after the leading message.
+    assert.deepEqual(seen.map(declaresCompact), [false, false, true, true]);
     const initial = getInitialSystemMessage(seen[3] ?? [])?.toolsAdded ?? [];
     assert.equal(
       initial.some((tool) => tool.name === "compact"),
@@ -116,11 +111,11 @@ test("records each stage once and keeps its system message at a fixed position",
     const records = runtime.session.sessionManager
       .getEntries()
       .filter((entry) => entry.type === "custom" && entry.customType === INSTRUCTION_TYPE);
-    assert.equal(records.length, 2);
+    assert.equal(records.length, 1);
     // Instructions are request-local: the stored transcript and prompt do not contain them.
     assert.doesNotMatch(
       JSON.stringify(runtime.session.sessionManager.buildSessionProjection().messages),
-      /\[Compaction preparation\]\\n|\[Compaction required\]\\n/,
+      /\[Compaction required\]\\n/,
     );
     assert.deepEqual(errors, []);
   } finally {
@@ -149,7 +144,8 @@ function rendered(entry: SessionEntry | undefined, expanded: boolean): string {
   assert.ok(component, "The instruction entry renders.");
   return (
     component
-      .render(200)
+      // Wide enough that no instruction line wraps.
+      .render(1000)
       // The box pads each line by one column.
       .map((line) => stripVTControlCharacters(line).replace(/^ /, "").trimEnd())
       .join("\n")
@@ -157,7 +153,7 @@ function rendered(entry: SessionEntry | undefined, expanded: boolean): string {
   );
 }
 
-test("the TUI draws each recorded instruction in the transcript instead of a notice", async (t) => {
+test("the TUI draws the recorded instruction in the transcript instead of a notice", async (t) => {
   const previous = getKeybindings();
   setKeybindings(new KeybindingsManager(EXPAND_KEY));
   t.after(() => {
@@ -167,9 +163,8 @@ test("the TUI draws each recorded instruction in the transcript instead of a not
     ui: true,
   });
   try {
-    faux.setResponses([fauxAssistantMessage("ok"), fauxAssistantMessage("ok")]);
-    await runtime.session.prompt(`first request ${filler(3500)}`);
-    await runtime.session.prompt(`second request ${filler(20000)}`);
+    faux.setResponses([fauxAssistantMessage("ok")]);
+    await runtime.session.prompt(`large request ${filler(20000)}`);
     assert.equal(
       runtime.session.extensionRunner.getEntryRenderer(INSTRUCTION_TYPE),
       renderInstruction,
@@ -177,23 +172,22 @@ test("the TUI draws each recorded instruction in the transcript instead of a not
     const entries = runtime.session.sessionManager
       .getEntries()
       .filter((entry) => entry.type === "custom" && entry.customType === INSTRUCTION_TYPE);
-    assert.equal(entries.length, 2);
-    const [prepare, compact] = entries;
+    assert.equal(entries.length, 1);
+    const [instruction] = entries;
 
-    const collapsed = rendered(prepare, false);
+    const collapsed = rendered(instruction, false);
     assert.match(
       collapsed,
-      /^\[Compaction preparation\] Added at [\d,]+ tokens, \d+% of the 100,000-token context window\. ctrl\+o to view the instruction$/,
+      /^\[Compaction required\] Added at [\d,]+ tokens, \d+% of the 100,000-token context window\. ctrl\+o to view the instruction$/,
     );
     assert.doesNotMatch(collapsed, /\n/);
-    const expanded = rendered(prepare, true);
-    assert.ok(prepare?.type === "custom" && typeof prepare.data === "object");
-    assert.ok(prepare.data !== null && "text" in prepare.data);
-    assert.ok(typeof prepare.data.text === "string");
+    const expanded = rendered(instruction, true);
+    assert.ok(instruction?.type === "custom" && typeof instruction.data === "object");
+    assert.ok(instruction.data !== null && "text" in instruction.data);
+    assert.ok(typeof instruction.data.text === "string");
     // Expanded, the box shows the exact instruction after the summary line.
-    assert.ok(expanded.endsWith(prepare.data.text), expanded);
+    assert.ok(expanded.endsWith(instruction.data.text), expanded);
     assert.doesNotMatch(expanded, /to view the instruction/);
-    assert.match(rendered(compact, false), /^\[Compaction required\] Added at /);
     assert.deepEqual(ui.notices, []);
     assert.deepEqual(errors, []);
   } finally {
@@ -201,20 +195,16 @@ test("the TUI draws each recorded instruction in the transcript instead of a not
   }
 });
 
-test("RPC clients get a notice for each recorded instruction", async () => {
+test("RPC clients get a notice for the recorded instruction", async () => {
   const { runtime, faux, errors, ui } = await testRuntime(SETTINGS, undefined, "rpc", false, {
     ui: true,
   });
   try {
     faux.setResponses([fauxAssistantMessage("ok"), fauxAssistantMessage("ok")]);
-    await runtime.session.prompt(`first request ${filler(3500)}`);
-    await runtime.session.prompt(`second request ${filler(20000)}`);
-    assert.equal(ui.notices.length, 2);
-    assert.match(
-      ui.notices[0] ?? "",
-      /^Compaction preparation instruction added at [\d,]+ tokens\.$/,
-    );
-    assert.match(ui.notices[1] ?? "", /^Compaction instruction added at [\d,]+ tokens\.$/);
+    await runtime.session.prompt(`first request ${filler(20000)}`);
+    await runtime.session.prompt("second request");
+    assert.deepEqual(ui.notices.length, 1);
+    assert.match(ui.notices[0] ?? "", /^Compaction instruction added at [\d,]+ tokens\.$/);
     assert.deepEqual(errors, []);
   } finally {
     await runtime.dispose();
@@ -226,6 +216,40 @@ test("the renderer skips data that is not an instruction record", () => {
     renderInstruction({ data: { stage: "later" } }, { expanded: true }, plainTheme),
     undefined,
   );
+});
+
+test("preparation instructions recorded by earlier versions are skipped", async () => {
+  const { runtime, faux, errors } = await testRuntime(SETTINGS);
+  try {
+    const seen: Message[][] = [];
+    const record: FauxResponseFactory = (context) => {
+      seen.push(context.messages);
+      return fauxAssistantMessage("ok");
+    };
+    faux.setResponses([record, record]);
+    await runtime.session.prompt("first small request");
+    const manager = runtime.session.sessionManager;
+    const anchor = manager.getBranch().findLast((entry) => entry.type === "message");
+    assert.ok(anchor);
+    const stale = {
+      stage: "prepare",
+      anchorEntryId: anchor.id,
+      text: "[Compaction preparation]\nRecord the state in a Markdown state file now.",
+      model: "anthropic/faux-1",
+      tokens: 3000,
+      contextWindow: 100_000,
+      timestamp: 1,
+    };
+    manager.appendCustomEntry(INSTRUCTION_TYPE, stale);
+    await runtime.session.prompt("second small request");
+    assert.deepEqual(laterSystemMessages(seen[1] ?? []), []);
+    assert.equal(declaresCompact(seen[1] ?? []), false);
+    assert.deepEqual(activeInstructions(manager.getBranch()), []);
+    assert.equal(renderInstruction({ data: stale }, { expanded: true }, plainTheme), undefined);
+    assert.deepEqual(errors, []);
+  } finally {
+    await runtime.dispose();
+  }
 });
 
 test("the collapsed instruction shows no hint when no key expands it", (t) => {
@@ -278,61 +302,6 @@ test("messages that share a timestamp keep the instruction at its anchor", async
     assert.match(second[0]?.after ?? "", /^second request/);
     assert.deepEqual(laterSystemMessages(seen[2] ?? []), second);
     assert.deepEqual(laterSystemMessages(seen[3] ?? []), second);
-    assert.deepEqual(errors, []);
-  } finally {
-    await runtime.dispose();
-  }
-});
-
-test("a single jump past both thresholds records one self-contained compaction instruction", async () => {
-  const { runtime, faux, errors } = await testRuntime(SETTINGS);
-  try {
-    let messages: Message[] = [];
-    faux.setResponses([
-      (context) => {
-        messages = context.messages;
-        return fauxAssistantMessage("ok");
-      },
-    ]);
-    await runtime.session.prompt(`large request ${filler(21000)}`);
-    const later = laterSystemMessages(messages);
-    assert.equal(later.length, 1);
-    assert.match(later[0]?.text ?? "", /^\[Compaction required\]/);
-    // No preparation instruction was posted, so this one asks for the state file itself.
-    assert.match(later[0]?.text ?? "", /Record the current state in a Markdown state file/);
-    const records = runtime.session.sessionManager
-      .getEntries()
-      .filter((entry) => entry.type === "custom" && entry.customType === INSTRUCTION_TYPE);
-    assert.equal(records.length, 1);
-    assert.deepEqual(errors, []);
-  } finally {
-    await runtime.dispose();
-  }
-});
-
-test("without prepareAt, only the self-contained compaction instruction is posted", async () => {
-  const { runtime, faux, errors } = await testRuntime({ default: { compactAt: 20000 } });
-  try {
-    const seen: Message[][] = [];
-    const record: FauxResponseFactory = (context) => {
-      seen.push(context.messages);
-      return fauxAssistantMessage("ok");
-    };
-    faux.setResponses([record, record, record]);
-    await runtime.session.prompt(`first request ${filler(3500)}`);
-    await runtime.session.prompt(`second request ${filler(20000)}`);
-    await runtime.session.prompt("third small request");
-
-    assert.deepEqual(laterSystemMessages(seen[0] ?? []), []);
-    const second = laterSystemMessages(seen[1] ?? []);
-    assert.equal(second.length, 1);
-    assert.match(second[0]?.text ?? "", /^\[Compaction required\]/);
-    assert.match(second[0]?.text ?? "", /Record the current state in a Markdown state file/);
-    assert.deepEqual(laterSystemMessages(seen[2] ?? []), second);
-    const records = runtime.session.sessionManager
-      .getEntries()
-      .filter((entry) => entry.type === "custom" && entry.customType === INSTRUCTION_TYPE);
-    assert.equal(records.length, 1);
     assert.deepEqual(errors, []);
   } finally {
     await runtime.dispose();
@@ -427,26 +396,6 @@ test("compact is declared only to supported models the settings enable", async (
   assert.deepEqual(await declared({ models: { "anthropic/faux-1": false } }), [false, false]);
   assert.deepEqual(await declared({ enabled: false }), [false, false]);
   assert.deepEqual(await declared({ default: "bad" }), [false, false]);
-});
-
-test("compact stays undeclared below compactAt, including after the preparation instruction", async () => {
-  const { runtime, faux, errors } = await testRuntime(SETTINGS);
-  try {
-    const seen: Message[][] = [];
-    const record: FauxResponseFactory = (context) => {
-      seen.push(context.messages);
-      return fauxAssistantMessage("ok");
-    };
-    faux.setResponses([record, record]);
-    await runtime.session.prompt("first small request");
-    await runtime.session.prompt(`second request ${filler(3500)}`);
-    assert.match(laterSystemMessages(seen[1] ?? [])[0]?.text ?? "", /^\[Compaction preparation\]/);
-    assert.deepEqual(seen.map(declaresCompact), [false, false]);
-    assert.equal(runtime.session.getActiveToolNames().includes("compact"), false);
-    assert.deepEqual(errors, []);
-  } finally {
-    await runtime.dispose();
-  }
 });
 
 test("a message that passes compactAt after the tool batch delays the instruction one request", async () => {
@@ -558,7 +507,7 @@ test("instructions are evaluated between tool calls within one run", async () =>
       parameters: Type.Object({}),
       execute: () =>
         Promise.resolve({
-          content: [{ type: "text", text: `large result ${filler(3500)}` }],
+          content: [{ type: "text", text: `large result ${filler(21000)}` }],
           details: undefined,
         }),
     });
@@ -575,8 +524,9 @@ test("instructions are evaluated between tool calls within one run", async () =>
     await runtime.session.prompt("read it");
     const later = laterSystemMessages(messages);
     assert.equal(later.length, 1);
-    assert.match(later[0]?.text ?? "", /^\[Compaction preparation\]/);
+    assert.match(later[0]?.text ?? "", /^\[Compaction required\]/);
     assert.match(later[0]?.after ?? "", /^large result/);
+    assert.equal(declaresCompact(messages), true);
     assert.deepEqual(errors, []);
   } finally {
     await runtime.dispose();
@@ -897,8 +847,8 @@ test("models set to false and invalid settings leave requests unchanged", async 
   for (const settings of [
     { default: false },
     { models: { "faux/faux-1": false } },
-    { default: { prepareAt: 6000, compactAt: 3000 } },
-    { default: { prepareAt: "bad", compactAt: 3000 } },
+    { default: { compactAt: 0 } },
+    { default: { compactAt: "bad" } },
   ]) {
     const { runtime, faux, errors } = await testRuntime(settings);
     try {

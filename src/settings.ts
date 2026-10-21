@@ -7,8 +7,6 @@ export const SETTINGS_FILE_NAME = "pi-compact-assistant.json";
 export type Threshold = number | `${number}%`;
 
 export interface Thresholds {
-  /** Optional. Without it, only the self-contained compaction instruction is posted. */
-  prepareAt?: Threshold;
   compactAt: Threshold;
 }
 
@@ -20,14 +18,9 @@ export interface Settings {
   models: Record<string, Thresholds | false>;
 }
 
-export interface ResolvedThresholds {
-  prepareTokens?: number;
-  compactTokens: number;
-}
-
 export const DEFAULT_SETTINGS: Settings = {
   enabled: true,
-  default: { prepareAt: "70%", compactAt: "80%" },
+  default: { compactAt: "80%" },
   models: {},
 };
 
@@ -55,19 +48,15 @@ function parseThreshold(value: unknown, path: string): Threshold {
 function parseThresholds(value: unknown, path: string): Thresholds | false {
   if (value === false) return false;
   if (!isRecord(value)) {
-    throw new Error(
-      `${path} must be an object with compactAt and an optional prepareAt, or false.`,
-    );
+    throw new Error(`${path} must be an object with compactAt, or false.`);
   }
   for (const key of Object.keys(value)) {
-    if (key !== "prepareAt" && key !== "compactAt") {
-      throw new Error(`${path}.${key} is not a setting. Use prepareAt and compactAt.`);
+    // Earlier versions read prepareAt. Settings files that still set it stay valid.
+    if (key !== "compactAt" && key !== "prepareAt") {
+      throw new Error(`${path}.${key} is not a setting. Use compactAt.`);
     }
   }
-  const compactAt = parseThreshold(value["compactAt"], `${path}.compactAt`);
-  return value["prepareAt"] === undefined
-    ? { compactAt }
-    : { prepareAt: parseThreshold(value["prepareAt"], `${path}.prepareAt`), compactAt };
+  return { compactAt: parseThreshold(value["compactAt"], `${path}.compactAt`) };
 }
 
 /** Validate a settings document. Omitted top-level fields use the defaults. */
@@ -134,24 +123,12 @@ export function isDisabled(settings: Settings, model: string): boolean {
   return selectedThresholds(settings, model) === false;
 }
 
-/**
- * Resolve token thresholds for one model. Returns undefined when the model is skipped.
- * Throws when a configured preparation threshold is not below the compaction threshold.
- */
-export function resolveThresholds(
+/** Resolve one model's `compactAt` in tokens. Returns undefined when the model is skipped. */
+export function resolveCompactTokens(
   settings: Settings,
   model: string,
   contextWindow: number,
-): ResolvedThresholds | undefined {
+): number | undefined {
   const selected = selectedThresholds(settings, model);
-  if (!selected) return undefined;
-  const compactTokens = tokens(selected.compactAt, contextWindow);
-  if (selected.prepareAt === undefined) return { compactTokens };
-  const prepareTokens = tokens(selected.prepareAt, contextWindow);
-  if (prepareTokens >= compactTokens) {
-    throw new Error(
-      `prepareAt (${prepareTokens} tokens) must be below compactAt (${compactTokens} tokens) for ${model}.`,
-    );
-  }
-  return { prepareTokens, compactTokens };
+  return selected ? tokens(selected.compactAt, contextWindow) : undefined;
 }

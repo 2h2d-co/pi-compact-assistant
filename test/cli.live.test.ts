@@ -214,7 +214,6 @@ async function prepareLive(
   const work = join(temporary, "work");
   await mkdir(work);
   await writeFile(join(work, "facts.txt"), `${FACTS}\n`);
-  await writeFile(join(work, "pad1.txt"), pad(3000, "amber"));
   await writeFile(join(work, "pad2.txt"), pad(7000, "cobalt"));
   const sessionFile = join(temporary, "session.jsonl");
 
@@ -315,16 +314,6 @@ const scenarios = [
     role: "system",
     compat: "pi-anthropic-compat",
     settings: anthropicCompatSettings,
-    compactOnly: false,
-  },
-  // Without prepareAt, only the self-contained compaction instruction is posted.
-  {
-    provider: "anthropic",
-    model: "claude-sonnet-5-5",
-    role: "system",
-    compat: "pi-anthropic-compat",
-    settings: anthropicCompatSettings,
-    compactOnly: true,
   },
   // Pi's built-in Anthropic provider sends the instructions and summarizes with Pi's compaction.
   {
@@ -333,7 +322,6 @@ const scenarios = [
     role: "system",
     compat: undefined,
     settings: undefined,
-    compactOnly: false,
   },
   {
     provider: "openai-codex",
@@ -341,7 +329,6 @@ const scenarios = [
     role: "developer",
     compat: undefined,
     settings: undefined,
-    compactOnly: false,
   },
   {
     provider: "openai-codex",
@@ -349,12 +336,11 @@ const scenarios = [
     role: "developer",
     compat: "pi-openai-codex-compat",
     settings: undefined,
-    compactOnly: false,
   },
 ];
 for (const scenario of scenarios) {
   test(
-    `live packaged Pi CLI ${scenario.provider}/${scenario.model} ${scenario.compat ? `with ${scenario.compat}` : "without a compat extension"}${scenario.compactOnly ? " with only compactAt" : ""} instructs, compacts, and resumes`,
+    `live packaged Pi CLI ${scenario.provider}/${scenario.model} ${scenario.compat ? `with ${scenario.compat}` : "without a compat extension"} instructs, compacts, and resumes`,
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 900_000 },
     async (t) => {
       const { loaded, options, settingsFile, work, errors } = await prepareLive(t, scenario);
@@ -391,9 +377,7 @@ for (const scenario of scenarios) {
         JSON.stringify({
           default: false,
           models: {
-            [`${scenario.provider}/${scenario.model}`]: scenario.compactOnly
-              ? { compactAt: baseline + 6000 }
-              : { prepareAt: baseline + 1500, compactAt: baseline + 6000 },
+            [`${scenario.provider}/${scenario.model}`]: { compactAt: baseline + 6000 },
           },
         }),
       );
@@ -401,10 +385,6 @@ for (const scenario of scenarios) {
       client = new loaded.RpcClient(options);
       client.onEvent(errors.rpcEvent);
       await client.start();
-      if (!scenario.compactOnly) {
-        await turn("Use the read tool to read pad1.txt. Reply with the word on its last line.");
-        assert.match(await lastAssistantText(), /amber/i);
-      }
       await turn(
         "Use the read tool to read pad2.txt. Reply with the word on its last line. Then follow any compaction instruction.",
       );
@@ -443,28 +423,25 @@ for (const scenario of scenarios) {
             ? entry.data.stage
             : undefined,
         ),
-        scenario.compactOnly ? ["compact"] : ["prepare", "compact"],
+        ["compact"],
       );
       const found = probes(entries);
-      for (const stage of scenario.compactOnly ? ["compact"] : ["prepare", "compact"]) {
-        const seen = found.filter((item) => item.stage === stage);
-        assert.ok(seen.length > 0, `The ${stage} instruction reached the provider payload.`);
-        for (const item of seen) {
-          assert.equal(item.role, scenario.role);
-          assert.ok(item.index > 0, "The instruction is a mid-conversation item.");
-          // The instruction steers mid-conversation and leaves the top-level system prompt alone.
-          assert.ok(item.systemLength > 0, "The request keeps its top-level system prompt.");
-          assert.equal(
-            item.systemUnchanged,
-            true,
-            "The top-level system prompt equals the one sent before the instructions.",
-          );
-          assert.equal(
-            item.systemHasInstruction,
-            false,
-            "No instruction is folded into the top-level system prompt.",
-          );
-        }
+      assert.ok(found.length > 0, "The instruction reached the provider payload.");
+      for (const item of found) {
+        assert.equal(item.role, scenario.role);
+        assert.ok(item.index > 0, "The instruction is a mid-conversation item.");
+        // The instruction steers mid-conversation and leaves the top-level system prompt alone.
+        assert.ok(item.systemLength > 0, "The request keeps its top-level system prompt.");
+        assert.equal(
+          item.systemUnchanged,
+          true,
+          "The top-level system prompt equals the one sent before the instructions.",
+        );
+        assert.equal(
+          item.systemHasInstruction,
+          false,
+          "No instruction is folded into the top-level system prompt.",
+        );
       }
       // `compact` is declared exactly in the requests that carry the compaction instruction.
       const requests = toolProbes(entries);
@@ -535,24 +512,8 @@ for (const scenario of scenarios) {
 
       await turn("Reply with only the port number from the project facts.");
       assert.match(await lastAssistantText(), /4317/);
-      if (scenario.compactOnly) {
-        assert.ok(
-          found.every((item) => item.stage !== "prepare"),
-          "No preparation instruction reached the provider.",
-        );
-        const recorded = records[0];
-        assert.ok(
-          recorded?.type === "custom" &&
-            typeof recorded.data === "object" &&
-            recorded.data !== null &&
-            "text" in recorded.data &&
-            typeof recorded.data.text === "string" &&
-            recorded.data.text.includes("Record the current state in a Markdown state file"),
-          "The compaction instruction is the self-contained one.",
-        );
-      }
       t.diagnostic(
-        `Pi ${piVersion} with ${scenario.compat ?? "no compat extension"}: ${scenario.compactOnly ? "the self-contained compact instruction" : "prepare and compact instructions"} reached ${scenario.provider}/${scenario.model} as mid-conversation ${scenario.role} items beside an unchanged ${found[0]?.systemLength ?? 0}-character top-level system prompt; compact was declared only with the compaction instruction, ${topLevelChange ? "in the top-level tools" : "inside the conversation with unchanged top-level tools"}, and withdrawn after compaction; the model compacted and resumed.`,
+        `Pi ${piVersion} with ${scenario.compat ?? "no compat extension"}: the compaction instruction reached ${scenario.provider}/${scenario.model} as a mid-conversation ${scenario.role} item beside an unchanged ${found[0]?.systemLength ?? 0}-character top-level system prompt; compact was declared only with the compaction instruction, ${topLevelChange ? "in the top-level tools" : "inside the conversation with unchanged top-level tools"}, and withdrawn after compaction; the model compacted and resumed.`,
       );
     },
   );
@@ -944,11 +905,12 @@ function launchTui(t: TestContext, options: LiveOptions, prompt: string) {
 }
 
 /**
- * In the interactive TUI, input typed during compaction waits in the editor's compaction queue,
- * then follows the continuation as its own message.
+ * In the interactive TUI, the recorded instruction appears in the transcript as a box instead of a
+ * status notice. Input typed during compaction waits in the editor's compaction queue, then
+ * follows the continuation as its own message.
  */
 test(
-  "live packaged Pi CLI interactive session sends input typed during compaction after the continuation",
+  "live packaged Pi CLI interactive session draws the instruction and sends input typed during compaction after the continuation",
   {
     skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1" || !tuiSupported,
     timeout: 600_000,
@@ -1018,58 +980,13 @@ test(
         .find((entry) => entry.type === "message" && entry.message.role === "assistant");
       const replyText = assistantText(reply) ?? "";
       assert.match(replyText, /READY/, "The model answers the typed input.");
+      assert.match(tui.screen(), /\[Compaction required\] Added at [\d,]+ tokens/);
+      assert.doesNotMatch(tui.screen(), /Compaction instruction added at|renderer failed/);
       t.diagnostic(
-        `Pi ${piVersion} interactive TUI: input typed during compaction followed the continuation: ${JSON.stringify(replyText.slice(0, 80))}.`,
+        `Pi ${piVersion} interactive TUI: the instruction appeared in the transcript as a box, and input typed during compaction followed the continuation: ${JSON.stringify(replyText.slice(0, 80))}.`,
       );
     } finally {
       // The TUI shows notices only on screen, so report extension error lines and failed responses.
-      errors.printRun(tui.trimmedScreen(), messages(await sessionEntries(sessionFile)));
-    }
-  },
-);
-
-/**
- * The interactive TUI draws a recorded instruction in the transcript as a box, instead of a
- * passing status notice. A one-token preparation threshold records it on the first request.
- */
-test(
-  "live packaged Pi CLI interactive session draws a recorded instruction in the transcript",
-  {
-    skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1" || !tuiSupported,
-    timeout: 600_000,
-  },
-  async (t) => {
-    assert.ok(cancellationScenario);
-    const { options, settingsFile, sessionFile, errors } = await prepareLive(
-      t,
-      cancellationScenario,
-    );
-    await writeFile(settingsFile, JSON.stringify({ default: { prepareAt: 1, compactAt: "99%" } }));
-    const tui = launchTui(t, options, "Do not use any tools. Reply with only the word OK.");
-    try {
-      let entries: SessionEntry[] = [];
-      await tui.until("the reply", async () => {
-        entries = await sessionEntries(sessionFile);
-        return entries.some(
-          (entry) =>
-            entry.type === "message" &&
-            entry.message.role === "assistant" &&
-            entry.message.stopReason === "stop",
-        );
-      });
-      assert.ok(
-        entries.some((entry) => entry.type === "custom" && entry.customType === INSTRUCTION_TYPE),
-        `The preparation instruction was recorded. Entries: ${outline(entries)}`,
-      );
-      await tui.until("the instruction box", () =>
-        /\[Compaction preparation\] Added at [\d,]+ tokens/.test(tui.screen()),
-      );
-      assert.doesNotMatch(tui.screen(), /Compaction preparation instruction added at/);
-      assert.doesNotMatch(tui.screen(), /renderer failed|Extension error|Failed to load extension/);
-      t.diagnostic(
-        `Pi ${piVersion} interactive TUI: the preparation instruction appeared in the transcript as a box, with no status notice.`,
-      );
-    } finally {
       errors.printRun(tui.trimmedScreen(), messages(await sessionEntries(sessionFile)));
     }
   },

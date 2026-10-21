@@ -12,9 +12,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   instruction, and withdraw it after every compaction. Models no longer see the tool or its
   guidance before the threshold, so they no longer compact on their own. The model can no longer
   compact at the user's request before the threshold. The tool has no system prompt guidelines;
-  the instructions, the tool description, and the cancellation notice carry its guidance.
+  the instruction, the tool description, and the cancellation notice carry its guidance.
   Anthropic receives the tool inside the conversation, so the cached prefix stays valid. With
   `pi-openai-codex-compat`, adding the tool costs one prompt-cache miss.
+
+### Removed
+
+- Remove the `[Compaction preparation]` instruction and the `prepareAt` setting. At `compactAt`,
+  the model gets only the self-contained `[Compaction required]` instruction, which asks it to
+  record the state in a Markdown state file and then call `compact`. The default is now
+  `{ "compactAt": "80%" }`. Settings files that still set `prepareAt` stay valid; the field is
+  ignored. Resumed sessions skip preparation instructions recorded by earlier versions.
 
 ## [0.0.3] - 2026-10-17
 

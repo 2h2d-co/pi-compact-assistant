@@ -4,7 +4,7 @@ export const PROBE_TYPE = "pi-compact-assistant-live:probe";
 export const TOOLS_PROBE_TYPE = "pi-compact-assistant-live:tools";
 
 export interface ProbedInstruction {
-  stage: "prepare" | "compact";
+  stage: "compact";
   role: string;
   index: number;
   count: number;
@@ -118,11 +118,7 @@ export default function wireProbe(pi: ExtensionAPI): void {
     items.forEach((item: unknown, index: number) => {
       if (typeof item !== "object" || item === null || !("role" in item)) return;
       const text = "content" in item ? textOf(item.content) : "";
-      const stage = text.startsWith("[Compaction preparation]")
-        ? "prepare"
-        : text.startsWith("[Compaction required]")
-          ? "compact"
-          : undefined;
+      const stage = text.startsWith("[Compaction required]") ? "compact" : undefined;
       if (stage) {
         found.push({
           stage,

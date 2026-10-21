@@ -17,12 +17,11 @@ import { Value } from "typebox/value";
 import {
   COMPACT_TOOL_NAME,
   continuationText,
+  INSTRUCTION_LABEL,
   instructionText,
-  reachedStage,
-  type Stage,
 } from "./instructions.ts";
 import { requirePiVersion } from "./pi-version.ts";
-import { isDisabled, loadSettings, resolveThresholds, type Settings } from "./settings.ts";
+import { isDisabled, loadSettings, resolveCompactTokens, type Settings } from "./settings.ts";
 import { findCodexCompatProblem, unsupportedReason } from "./support.ts";
 
 export const INSTRUCTION_TYPE = "pi-compact-assistant:instruction";
@@ -35,7 +34,11 @@ type Projection = ReturnType<ExtensionContext["sessionManager"]["buildSessionPro
 
 /** A recorded instruction. The text is fixed so every later request carries identical bytes. */
 export interface InstructionRecord {
-  stage: Stage;
+  /**
+   * Always `compact`. Earlier versions also recorded `prepare` instructions, which this version
+   * skips.
+   */
+  stage: "compact";
   /** The last context entry when the threshold was reached. The instruction follows it. */
   anchorEntryId: string;
   text: string;
@@ -92,7 +95,7 @@ function isInstructionRecord(value: unknown): value is InstructionRecord {
   if (typeof value !== "object" || value === null) return false;
   return (
     "stage" in value &&
-    (value.stage === "prepare" || value.stage === "compact") &&
+    value.stage === "compact" &&
     "anchorEntryId" in value &&
     typeof value.anchorEntryId === "string" &&
     "text" in value &&
@@ -101,11 +104,6 @@ function isInstructionRecord(value: unknown): value is InstructionRecord {
     typeof value.timestamp === "number"
   );
 }
-
-const STAGE_LABELS: Record<Stage, string> = {
-  prepare: "[Compaction preparation]",
-  compact: "[Compaction required]",
-};
 
 function tokenSummary(record: InstructionRecord): string {
   if (!Number.isFinite(record.tokens)) return "Added to the conversation.";
@@ -129,7 +127,7 @@ export function renderInstruction(
   const record = entry.data;
   if (!isInstructionRecord(record)) return undefined;
   const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
-  const summary = `${theme.fg("customMessageLabel", theme.bold(STAGE_LABELS[record.stage]))} ${theme.fg("customMessageText", tokenSummary(record))}`;
+  const summary = `${theme.fg("customMessageLabel", theme.bold(INSTRUCTION_LABEL))} ${theme.fg("customMessageText", tokenSummary(record))}`;
   const key = keyText("app.tools.expand");
   // Without a bound expand key there is nothing to press, so no hint is shown.
   const hint =
@@ -268,40 +266,26 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     return isDisabled(settings, `${model.provider}/${model.id}`);
   }
 
-  /** The model's thresholds, or undefined when it has none or its settings are invalid. */
-  function thresholdsFor(
-    ctx: ExtensionContext,
-    key: string,
-    contextWindow: number,
-  ): ReturnType<typeof resolveThresholds> {
-    if (!settings) return undefined;
-    try {
-      return resolveThresholds(settings, key, contextWindow);
-    } catch (error) {
-      report(ctx, `thresholds:${key}`, `pi-compact-assistant skips ${key}. ${errorText(error)}`);
-      return undefined;
-    }
-  }
-
   /**
-   * Whether this compaction cycle reached the compaction stage: a `[Compaction required]`
-   * instruction is recorded, or usage plus `pendingTokens` reaches `compactAt`.
+   * Whether this compaction cycle needs compaction: the instruction is recorded, or usage plus
+   * `pendingTokens` reaches `compactAt`.
    */
   function compactionDue(
     ctx: ExtensionContext,
     model: NonNullable<ExtensionContext["model"]>,
     pendingTokens: number,
   ): boolean {
-    const branch = ctx.sessionManager.getBranch();
-    if (activeInstructions(branch).some((record) => record.stage === "compact")) return true;
+    if (!settings) return false;
+    if (activeInstructions(ctx.sessionManager.getBranch()).length > 0) return true;
     const usage = ctx.getContextUsage();
     if (usage?.tokens == null) return false;
-    const thresholds = thresholdsFor(ctx, `${model.provider}/${model.id}`, usage.contextWindow);
-    return thresholds !== undefined && usage.tokens + pendingTokens >= thresholds.compactTokens;
+    const key = `${model.provider}/${model.id}`;
+    const compactTokens = resolveCompactTokens(settings, key, usage.contextWindow);
+    return compactTokens !== undefined && usage.tokens + pendingTokens >= compactTokens;
   }
 
   /**
-   * Declare `compact` only while the compaction stage is reached, and only to supported models
+   * Declare `compact` only while compaction is due, and only to supported models
    * the settings enable. Pi appends a declaration change to the transcript before the next model
    * request, so the change reaches the model with that request. `pendingTokens` counts the
    * message that starts a run, which the session does not contain yet.
@@ -426,41 +410,33 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
     const records = activeInstructions(branch);
     const projection = ctx.sessionManager.buildSessionProjection();
     const usage = ctx.getContextUsage();
-    const thresholds = usage ? thresholdsFor(ctx, key, usage.contextWindow) : undefined;
+    const compactTokens = usage
+      ? resolveCompactTokens(settings, key, usage.contextWindow)
+      : undefined;
     // Unsupported models get no instructions, including ones recorded under another model.
     const unsupported = unsupportedReason(model, codexCompatProblem);
     if (unsupported) {
       // Models covered only by the default stay quiet; explicit entries and old compat do not.
       if (
-        thresholds &&
+        compactTokens !== undefined &&
         (Object.hasOwn(settings.models, key) || unsupported === codexCompatProblem)
       ) {
         report(ctx, `support:${key}`, `pi-compact-assistant skips ${key}. ${unsupported}`);
       }
       return undefined;
     }
-    const stage =
-      thresholds && usage?.tokens != null ? reachedStage(usage.tokens, thresholds) : undefined;
-    const recorded = new Set(records.map((record) => record.stage));
+    const reached =
+      compactTokens !== undefined && usage?.tokens != null && usage.tokens >= compactTokens;
     const anchor = projection.entries.findLast((entry) => entry.messages.length > 0);
-    // The compaction instruction asks for `compact`, so it waits until the tool is declared. Pi
-    // fixed this request's tools before this handler ran, so the tool arrives with the next one.
+    // The instruction asks for `compact`, so it waits until the tool is declared. Pi fixed this
+    // request's tools before this handler ran, so the tool arrives with the next one.
     const declared = pi.getActiveTools().includes(COMPACT_TOOL_NAME);
-    if (stage === "compact" && !declared) syncTool(ctx);
-    if (
-      stage &&
-      (stage !== "compact" || declared) &&
-      thresholds &&
-      usage?.tokens != null &&
-      anchor &&
-      !recorded.has("compact") &&
-      !recorded.has(stage)
-    ) {
+    if (reached && !declared) syncTool(ctx);
+    if (reached && declared && usage?.tokens != null && anchor && records.length === 0) {
       const record: InstructionRecord = {
-        stage,
+        stage: "compact",
         anchorEntryId: anchor.sourceEntry.id,
-        // Without a preparation instruction in this cycle, the compaction instruction stands alone.
-        text: instructionText(stage === "compact" && !recorded.has("prepare") ? "combined" : stage),
+        text: instructionText(),
         model: key,
         tokens: usage.tokens,
         contextWindow: usage.contextWindow,
@@ -471,9 +447,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
       // The TUI draws the entry in the transcript. RPC clients get a notice instead.
       if (ctx.hasUI && ctx.mode !== "tui") {
         ctx.ui.notify(
-          stage === "prepare"
-            ? `Compaction preparation instruction added at ${usage.tokens.toLocaleString("en-US")} tokens.`
-            : `Compaction instruction added at ${usage.tokens.toLocaleString("en-US")} tokens.`,
+          `Compaction instruction added at ${usage.tokens.toLocaleString("en-US")} tokens.`,
           "info",
         );
       }

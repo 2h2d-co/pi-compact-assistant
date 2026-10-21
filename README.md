@@ -4,16 +4,15 @@ Pi extension that lets the model compact its own conversation at a good moment, 
 automatic compaction interrupts it.
 
 - It checks context usage before every model request, including requests between tool calls.
-- At a **preparation threshold**, it tells the model to keep working and to record the work's
-  state in a Markdown file.
-- At a **compaction threshold**, it declares the **`compact`** tool and tells the model to update
-  that file now, then call `compact` with the file's path and the next step. Before that
-  threshold and after each compaction, the model has no `compact` tool.
+- At the **compaction threshold**, `compactAt`, it declares the **`compact`** tool and tells the
+  model to record the work's state in a Markdown file, then call `compact` with the file's path
+  and the next step. Before that threshold and after each compaction, the model has no `compact`
+  tool.
 - `compact` runs Pi's compaction after the turn ends, then delivers the model's continuation
   message and resumes the agent.
 
-The instructions are mid-conversation system messages. Anthropic receives them as `system`
-messages and OpenAI Codex as `developer` messages, in place in the conversation. The top-level
+The instruction is a mid-conversation system message. Anthropic receives it as a `system`
+message and OpenAI Codex as a `developer` message, in place in the conversation. The top-level
 system prompt, Anthropic's `system` field or Codex's `instructions` field, stays unchanged.
 
 ## Requirements and loading
@@ -43,29 +42,28 @@ Settings are read from `~/.pi/agent/pi-compact-assistant.json` when a session st
 ```json
 {
   "enabled": true,
-  "default": { "prepareAt": "70%", "compactAt": "80%" },
+  "default": { "compactAt": "80%" },
   "models": {
-    "anthropic/claude-opus-5-5": { "prepareAt": 450000, "compactAt": 500000 },
+    "anthropic/claude-opus-5-5": { "compactAt": 500000 },
     "anthropic/claude-fable-5-1": { "compactAt": 500000 },
-    "openai-codex/gpt-6.1-sol": { "prepareAt": "60%", "compactAt": "75%" },
+    "openai-codex/gpt-6.1-sol": { "compactAt": "75%" },
     "openai-codex/gpt-5.3-codex-spark": false
   }
 }
 ```
 
-| Setting   | Value                                                           | Default                                      |
-| --------- | --------------------------------------------------------------- | -------------------------------------------- |
-| `enabled` | `true` or `false`                                               | `true`                                       |
-| `default` | Thresholds for models without an entry, or `false` to skip them | `{ "prepareAt": "70%", "compactAt": "80%" }` |
-| `models`  | Thresholds or `false`, keyed by exact `provider/modelId`        | `{}`                                         |
+| Setting   | Value                                                                | Default                  |
+| --------- | -------------------------------------------------------------------- | ------------------------ |
+| `enabled` | `true` or `false`                                                    | `true`                   |
+| `default` | `{ "compactAt": ... }` for models without an entry, or `false`       | `{ "compactAt": "80%" }` |
+| `models`  | `{ "compactAt": ... }` or `false`, keyed by exact `provider/modelId` | `{}`                     |
 
-A threshold is a whole token count, such as `450000`, or a percentage of the model's context
-window, such as `"70%"`. A model entry needs `compactAt`. `prepareAt` is optional and must
-resolve below `compactAt`. Without `prepareAt`, the model gets only the self-contained
-`[Compaction required]` instruction at `compactAt`. Keys are exact and case-sensitive.
+`compactAt` is a whole token count, such as `500000`, or a percentage of the model's context
+window, such as `"80%"`. Keys are exact and case-sensitive. Earlier versions also read
+`prepareAt`. This version ignores it, so settings files that still set it stay valid.
 
-An invalid file disables the extension for the session. Interactive and RPC sessions show an error. Thresholds that are
-invalid for one model skip that model.
+An invalid file disables the extension for the session. Interactive and RPC sessions show an
+error.
 
 ### Keep Pi's automatic compaction as a backstop
 
@@ -86,37 +84,32 @@ compact at 600,000:
 
 ## Instructions
 
-Each stage is recorded once per compaction cycle as a custom session entry. The entry stores the
-rendered text and the context entry it follows. Before each request, the extension adds the
-recorded instructions as system messages directly after those entries. The instructions:
+The `[Compaction required]` instruction is recorded once per compaction cycle as a custom session
+entry. The entry stores the rendered text and the context entry it follows. Before each request,
+the extension adds the recorded instruction as a system message directly after that entry. The
+instruction:
 
-- are not stored as conversation messages, so summaries and later prompts never contain them;
-- stay at the same position in later requests, so prompt-cache prefixes stay valid;
-- stop after a compaction, until usage reaches a threshold again; and
-- contain no usage figures, so their text is the same in every session.
+- is not stored as a conversation message, so summaries and later prompts never contain it;
+- stays at the same position in later requests, so prompt-cache prefixes stay valid;
+- stops after a compaction, until usage reaches `compactAt` again; and
+- contains no usage figures, so its text is the same in every session.
 
-The interactive TUI draws each recorded instruction in the transcript as a box with its stage and
+The interactive TUI draws the recorded instruction in the transcript as a box with its label and
 the token count at which it was added. Expand tool output, `ctrl+o` by default, to see the exact
 instruction text. The box is not sent to the model. RPC clients get a notice instead.
 
-The preparation instruction, `[Compaction preparation]`, tells the model not to stop or wrap up
-early, because compaction does not end the task. The model records the goal, constraints,
-decisions, changed files, validation results, running processes, open questions, and next step in
-a Markdown state file and updates it when the state changes materially. It reuses the task's
-state file or creates one where project instructions keep working notes, or outside tracked
-files. It never puts the state in project documentation and never stages or commits the file.
-The model has no `compact` tool yet.
+The instruction tells the model that compaction does not end the task and to act now. The model
+finishes only a half-applied change. It records the goal, constraints, decisions, changed files,
+validation results, running processes, open questions, and next step in a Markdown state file.
+It reuses the task's state file or creates one where project instructions keep working notes, or
+outside tracked files. It never puts the state in project documentation and never stages or
+commits the file. Then it calls `compact` as the only tool call in its response, with the file's
+absolute path and the exact next step. A model that cannot or may not write files skips the file
+and puts the full state in the message. After compaction, the continuation tells the model to
+read the named state file before acting.
 
-`[Compaction required]` tells the model to act now: finish only a half-applied change, update the
-state file, then call `compact` as the only tool call in its response, with the file's absolute
-path and the exact next step. A model that cannot or may not write files skips the file and puts
-the full state in the message. After compaction, the continuation tells the model to read the
-named state file before acting.
-
-The extension records which instructions it posted in each compaction cycle. If the preparation
-instruction was never posted, because usage passed both thresholds at once or the model has no
-`prepareAt`, it posts a self-contained `[Compaction required]` instruction instead. That instruction asks the model to
-record the state in a Markdown state file under the same rules before calling `compact`.
+Earlier versions also posted a `[Compaction preparation]` instruction at `prepareAt`. This
+version skips such instructions in resumed sessions.
 
 ### Supported models
 
@@ -128,7 +121,7 @@ The extension instructs only models that meet all of these conditions:
   GPT-5.6, GPT-6, and GPT-6.1 models this way. For other models Pi would fold each instruction
   into the leading system prompt, which changes the cached prefix; and
 - for `openai-codex`, a loaded `pi-openai-codex-compat` is 0.0.23 or later. The extension reads
-  its version from the loaded package. Older versions drop the instructions from Codex requests.
+  its version from the loaded package. Older versions drop the instruction from Codex requests.
 
 Other models get no instructions, even ones recorded while a supported model was selected. A model
 with its own settings entry, or any Codex model with an outdated `pi-openai-codex-compat`, shows an
@@ -142,8 +135,8 @@ settings file is invalid.
 
 ### When `compact` is declared
 
-The extension declares `compact` only while the compaction stage is reached: context usage is at
-`compactAt`, or a `[Compaction required]` instruction is recorded since the latest compaction.
+The extension declares `compact` only while compaction is due: context usage is at `compactAt`,
+or a `[Compaction required]` instruction is recorded since the latest compaction.
 Any compaction withdraws it, including Pi's automatic compaction and `/compact`. The model cannot
 compact at the user's request before the threshold.
 
@@ -163,7 +156,7 @@ instruction:
   compaction instruction.
 
 `compact` has no system prompt guidelines, so declaring it leaves the system prompt unchanged.
-The instructions and the tool description carry its guidance.
+The instruction, the tool description, and the cancellation notice carry its guidance.
 
 A message that arrives after a tool batch, such as a large steering message, can pass
 `compactAt` after the extension updated the declaration for the next request. That request then
@@ -227,13 +220,13 @@ never files, processes, or permissions.
 
 - **`pi-anthropic-compat`**: the native Anthropic compaction handles `compact`. Live tests pass
   with Claude Sonnet 5.5.
-- Without a compat extension, Pi's built-in Anthropic provider receives the instructions as system
-  messages, and Pi writes the summary. Live tests pass with Claude Sonnet 5.5.
+- Without a compat extension, Pi's built-in Anthropic provider receives the instruction as a system
+  message, and Pi writes the summary. Live tests pass with Claude Sonnet 5.5.
 - **`pi-openai-codex-compat`** 0.0.23 or later: Codex remote compaction handles `compact`, and the
-  instructions reach Codex as developer messages. Live tests pass with GPT-6.1 Sol. Version 0.0.22
-  and earlier drop the instructions, because they build Codex requests only from the stored session.
-- Without a compat extension, Pi's built-in Codex provider receives the instructions as developer
-  messages, and Pi writes the summary. Live tests pass with GPT-6.1 Sol.
+  instruction reaches Codex as a developer message. Live tests pass with GPT-6.1 Sol. Version 0.0.22
+  and earlier drop the instruction, because they build Codex requests only from the stored session.
+- Without a compat extension, Pi's built-in Codex provider receives the instruction as a developer
+  message, and Pi writes the summary. Live tests pass with GPT-6.1 Sol.
 
 ## Development
 
@@ -249,8 +242,8 @@ npm run pack:dry
 
 `npm run test:live` packs the extension and runs the packaged Pi CLI against real providers. It
 uses your Pi login through an isolated agent directory, loads the pinned system prompt patcher and
-the provider's compat extension, and checks that both instructions reach the provider payload as
-mid-conversation items beside an unchanged top-level system prompt, the model calls `compact`,
+the provider's compat extension, and checks that the instruction reaches the provider payload as a
+mid-conversation item beside an unchanged top-level system prompt, the model calls `compact`,
 compaction runs, and the agent resumes with earlier facts intact. They also check that the
 provider payload declares `compact` only in requests that carry the compaction instruction,
 that compaction withdraws it, and that the top-level `tools` field stays unchanged except with
@@ -262,8 +255,8 @@ calls `compact` and during compaction. They check that compaction still runs, th
 reaches the model before compaction, and that the second follows the continuation as its own
 message. Print runs in text and JSON mode must compact and answer the continuation before they
 exit. An interactive TUI run, in a pseudo-terminal from the operating system's `script` utility
-on macOS or Linux, types input during compaction and checks that it follows the continuation.
-A second TUI run checks that a recorded instruction appears in the transcript as a box.
+on macOS or Linux, checks that the recorded instruction appears in the transcript as a box, types
+input during compaction, and checks that the input follows the continuation.
 Release validation runs it against the exact release archive.
 
 ## Packaging
