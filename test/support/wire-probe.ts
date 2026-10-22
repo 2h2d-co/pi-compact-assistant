@@ -55,10 +55,23 @@ function toolNames(declarations: unknown): string[] {
   return tools.flatMap((tool) => toolName(tool) ?? []);
 }
 
+/** The header of Pi AI's Codex removal notice, followed by one `- name` line per removed tool. */
+const REMOVAL_NOTICE = "The following tools are no longer available. Do not call them:\n";
+
+/** The tools a Codex developer message announces as removed. */
+function removedTools(text: string): string[] {
+  const start = text.indexOf(REMOVAL_NOTICE);
+  if (start < 0) return [];
+  const lines = text.slice(start + REMOVAL_NOTICE.length).split("\n");
+  const end = lines.findIndex((line) => !line.startsWith("- "));
+  return lines.slice(0, end < 0 ? undefined : end).map((line) => line.slice(2));
+}
+
 /**
  * The tools a payload leaves declared. Anthropic keeps the first request's `tools` for the prompt
  * cache and changes the set with `tool_addition` and `tool_removal` blocks in the conversation.
- * Pi AI's Codex adapter adds tools with `additional_tools` input items.
+ * Pi AI's Codex adapter declares tools in `additional_tools` input items and announces removals
+ * in developer text, because those items cannot remove a tool.
  */
 function declaredTools(declarations: unknown, items: readonly unknown[]): string[] {
   const names = new Set(toolNames(declarations));
@@ -69,6 +82,9 @@ function declaredTools(declarations: unknown, items: readonly unknown[]): string
       continue;
     }
     if (!("content" in item)) continue;
+    if ("role" in item && item.role === "developer") {
+      for (const name of removedTools(textOf(item.content))) names.delete(name);
+    }
     const blocks: unknown[] = Array.isArray(item.content) ? item.content : [];
     for (const block of blocks) {
       if (typeof block !== "object" || block === null || !("type" in block)) continue;

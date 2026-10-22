@@ -465,8 +465,9 @@ for (const scenario of scenarios) {
         "Compaction withdraws compact.",
       );
       // Anthropic and Pi AI's Codex adapter add `compact` inside the conversation and keep the
-      // top-level tools of the request before. pi-openai-codex-compat sends the complete current
-      // tool set at the top level by design, so adding `compact` changes it.
+      // top-level tools of the request before, which Pi AI's Codex adapter leaves empty.
+      // pi-openai-codex-compat sends the complete current tool set at the top level by design, so
+      // adding `compact` changes it.
       const topLevelChange = scenario.compat === "pi-openai-codex-compat";
       const added = cycle.findIndex((request) => request.names.includes("compact"));
       const before = cycle[added - 1];

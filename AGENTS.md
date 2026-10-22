@@ -3,7 +3,7 @@
 - This package adds context-threshold compaction instructions and the `compact` tool. Keep it
   focused on compaction. Session navigation and handoff experiments belong in
   `pi-session-tools`.
-- Support Pi `>=1.3.0 <1.4.0`. Keep Pi peer ranges bounded below the next Pi minor release and pin
+- Support Pi `>=1.4.0 <1.5.0`. Keep Pi peer ranges bounded below the next Pi minor release and pin
   development dependencies to the version actually tested. Do not keep fallbacks for Pi versions
   below the minimum.
 - Pi extensions run with full system permissions; keep side effects explicit and documented.
