@@ -28,6 +28,15 @@ export const INSTRUCTION_TYPE = "pi-compact-assistant:instruction";
 export const CONTINUATION_TYPE = "pi-compact-assistant:continuation";
 export const NOTICE_TYPE = "pi-compact-assistant:notice";
 export const HELD_WIDGET = "pi-compact-assistant:held";
+/**
+ * Shared `pi.events` channel on which an extension names why it cancelled a compaction, as
+ * `{ source, reason }`. Pi itself reports only "Compaction cancelled".
+ */
+export const COMPACTION_CANCELLED_CHANNEL = "compaction:cancelled";
+const CANCELLED_BY_PI = "Compaction cancelled";
+/** A published reason longer than this is ignored rather than shown to the model. */
+const MAX_REASON_LENGTH = 1000;
+const SOURCE = /^[\w@./-]{1,100}$/;
 
 type ContextMessage = ContextWithSystemEvent["messages"][number];
 type Projection = ReturnType<ExtensionContext["sessionManager"]["buildSessionProjection"]>;
@@ -60,6 +69,8 @@ interface Request {
   instructions: string | undefined;
   dispatched: boolean;
   held: HeldInput[];
+  /** Reasons other extensions published while this request's compaction ran. */
+  cancellations: string[];
 }
 
 function preview(text: string): string {
@@ -220,6 +231,15 @@ export function injectInstructions(
   return messages.flatMap((message, index) => [message, ...(inserts.get(index) ?? [])]);
 }
 
+/** A published cancellation as notice text, or undefined for a malformed payload. */
+export function cancellationText(data: unknown): string | undefined {
+  if (typeof data !== "object" || data === null) return undefined;
+  const reason = "reason" in data && typeof data.reason === "string" ? data.reason.trim() : "";
+  if (!reason || reason.length > MAX_REASON_LENGTH) return undefined;
+  const source = "source" in data && typeof data.source === "string" ? data.source : "";
+  return SOURCE.test(source) ? `${source} cancelled it. ${reason}` : reason;
+}
+
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : "Compaction failed.";
 }
@@ -249,6 +269,11 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
   let pending: Request | undefined;
   const reported = new Set<string>();
   pi.registerEntryRenderer(INSTRUCTION_TYPE, renderInstruction);
+  // Only reasons published while this extension's own compaction runs are kept.
+  pi.events.on(COMPACTION_CANCELLED_CHANNEL, (data) => {
+    const text = cancellationText(data);
+    if (text && pending?.dispatched) pending.cancellations.push(text);
+  });
 
   function report(ctx: ExtensionContext, key: string, message: string): void {
     if (reported.has(key)) return;
@@ -486,7 +511,12 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
         });
       });
     } catch (error) {
-      stop(request, ctx, error);
+      // Pi reports an extension's cancellation without its reason. Use the published one.
+      const published =
+        errorText(error) === CANCELLED_BY_PI && request.cancellations.length > 0
+          ? new Error(request.cancellations.join(" "))
+          : error;
+      stop(request, ctx, published);
       return;
     }
     pending = undefined;
@@ -533,6 +563,7 @@ export function compactAssistant(pi: ExtensionAPI, options: CompactAssistantOpti
         instructions: input.instructions?.trim() || undefined,
         dispatched: false,
         held: [],
+        cancellations: [],
       };
       pending = request;
       return Promise.resolve({

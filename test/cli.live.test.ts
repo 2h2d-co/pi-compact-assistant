@@ -534,15 +534,23 @@ async function settledEntries(
   return entries;
 }
 
+const cancellationScenario = scenarios[0];
 /**
  * Each way an accepted request is cancelled, through the packaged CLI and a real model that
- * reaches the compaction threshold. The fixture interrupts at the point a user or extension would.
+ * reaches the compaction threshold. `abort` and `fail` use the cancel probe, which interrupts at
+ * the point a user or extension would. `native` makes pi-anthropic-compat cancel for real with a
+ * tail target no recorded request meets, before any summary request, and checks that the notice
+ * carries the reason it publishes.
  */
-const cancellations: { mode: CancelMode; notice: RegExp }[] = [
+const cancellations: { mode: CancelMode | "native"; notice: RegExp }[] = [
   { mode: "abort", notice: /did not run: The run was aborted\./ },
   { mode: "fail", notice: /did not run: Compaction cancelled/ },
+  {
+    mode: "native",
+    notice:
+      /did not run: pi-anthropic-compat cancelled it\. No recorded safe boundary satisfies native tail retention\./,
+  },
 ];
-const cancellationScenario = scenarios[0];
 /**
  * After {@link armCompaction}, reading `pad2.txt` passes `compactAt`, so the next request carries
  * `compact` and the `[Compaction required]` instruction.
@@ -565,7 +573,16 @@ for (const cancellation of cancellations) {
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
     async (t) => {
       assert.ok(cancellationScenario);
-      const prepared = await prepareLive(t, cancellationScenario, { cancel: cancellation.mode });
+      const prepared =
+        cancellation.mode === "native"
+          ? await prepareLive(t, {
+              ...cancellationScenario,
+              settings: {
+                file: "pi-anthropic-compat.json",
+                value: { enabled: true, keepRecentTokens: 200_000 },
+              },
+            })
+          : await prepareLive(t, cancellationScenario, { cancel: cancellation.mode });
       const { loaded, options, errors } = prepared;
       await armCompaction(prepared);
       const client: RpcClient = new loaded.RpcClient(options);

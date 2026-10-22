@@ -18,11 +18,13 @@ import {
 import type { AgentSession, ExtensionFactory, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager, getKeybindings, setKeybindings } from "@earendil-works/pi-tui";
 import {
+  COMPACTION_CANCELLED_CHANNEL,
   CONTINUATION_TYPE,
   HELD_WIDGET,
   INSTRUCTION_TYPE,
   NOTICE_TYPE,
   activeInstructions,
+  cancellationText,
   renderInstruction,
 } from "../src/extension.ts";
 import {
@@ -728,6 +730,49 @@ test("a failed compaction cancels the request and tells the model", async () => 
   assert.equal(result.notices.length, 1);
   assert.match(result.notices[0] ?? "", /did not run: Compaction cancelled/);
   assert.deepEqual(result.order, [NOTICE_TYPE]);
+});
+
+test("a published cancellation reason replaces Pi's generic message in the notice", async () => {
+  const reason =
+    "No recorded safe boundary satisfies native tail retention. History was preserved.";
+  const result = await interruptedRequest((pi) => {
+    // Published after the request was accepted but before its compaction runs. It belongs to
+    // something else and must not reach the notice.
+    pi.on("tool_execution_end", (event) => {
+      if (event.toolName !== "compact") return;
+      pi.events.emit(COMPACTION_CANCELLED_CHANNEL, { source: "early", reason: "Too early." });
+    });
+    pi.on("session_before_compact", () => {
+      pi.events.emit(COMPACTION_CANCELLED_CHANNEL, { source: "pi-anthropic-compat", reason });
+      return { cancel: true };
+    });
+  });
+  assert.equal(result.notices.length, 1);
+  assert.match(
+    result.notices[0] ?? "",
+    /did not run: pi-anthropic-compat cancelled it\. No recorded safe boundary satisfies native tail retention\. History was preserved\. Nothing was retried\./,
+  );
+  assert.doesNotMatch(result.notices[0] ?? "", /Compaction cancelled|Too early/);
+  assert.deepEqual(result.order, [NOTICE_TYPE]);
+});
+
+test("published cancellations are read only from well-formed payloads", () => {
+  assert.equal(
+    cancellationText({ source: "pi-anthropic-compat", reason: " Failed. " }),
+    "pi-anthropic-compat cancelled it. Failed.",
+  );
+  assert.equal(cancellationText({ reason: "Failed." }), "Failed.");
+  assert.equal(cancellationText({ source: "bad source!", reason: "Failed." }), "Failed.");
+  for (const data of [
+    undefined,
+    "Failed.",
+    { source: "x" },
+    { reason: "  " },
+    { reason: 7 },
+    { reason: "x".repeat(1001) },
+  ]) {
+    assert.equal(cancellationText(data), undefined, JSON.stringify(data));
+  }
 });
 
 test("input during the run reaches the model before compaction, which still runs", async () => {

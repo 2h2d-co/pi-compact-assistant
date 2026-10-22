@@ -213,6 +213,14 @@ model to check the reason and any newer user input before it calls `compact` aga
 or revise `instructions` after a summarizer refusal. `compact` stays declared until a compaction
 succeeds.
 
+Pi reports an extension's cancellation only as "Compaction cancelled". An extension can name its
+reason on the shared `pi.events` channel `compaction:cancelled` as `{ source, reason }`, where
+`reason` is a complete sentence. The notice then states that reason and the extension that
+cancelled, such as "pi-anthropic-compat cancelled it. No recorded safe boundary satisfies native
+tail retention." Only reasons published while this request's compaction runs count.
+[`pi-anthropic-compat`](https://github.com/2h2d-co/pi-anthropic-compat) 0.0.16 and later
+publish them.
+
 Cancelled requests are never retried or replayed. `compact` changes conversation context only,
 never files, processes, or permissions.
 
@@ -250,7 +258,8 @@ that compaction withdraws it, and that the top-level `tools` field stays unchang
 `pi-openai-codex-compat`. Further scenarios first measure the context after a small turn and set
 `compactAt` above it, so reading a padding file passes the threshold. The model then calls
 `compact`, and the test aborts the run or cancels the compaction and checks that the continuation
-is withheld with a notice. Two more send user input through RPC while the model
+is withheld with a notice. One of them lets pi-anthropic-compat cancel for real and checks that
+the notice names its published reason. Two more send user input through RPC while the model
 calls `compact` and during compaction. They check that compaction still runs, that the first input
 reaches the model before compaction, and that the second follows the continuation as its own
 message. Print runs in text and JSON mode must compact and answer the continuation before they

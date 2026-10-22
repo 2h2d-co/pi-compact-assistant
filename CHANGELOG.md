@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- The notice for a cancelled compaction now states why when the cancelling extension publishes a
+  reason on the shared `pi.events` channel `compaction:cancelled`, instead of Pi's generic
+  "Compaction cancelled". pi-anthropic-compat 0.0.16 and later publish their reasons.
+
 ## [0.0.5] - 2026-10-22
 
 ### Changed
