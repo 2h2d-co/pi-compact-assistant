@@ -337,10 +337,20 @@ const scenarios = [
     compat: "pi-openai-codex-compat",
     settings: undefined,
   },
+  // A `!` shell command before the first prompt comes ahead of Pi's prompt in the transcript.
+  // pi-anthropic-compat moves the prompt first, so adding `compact` keeps the prompt cache.
+  {
+    provider: "anthropic",
+    model: "claude-sonnet-5-5",
+    role: "system",
+    compat: "pi-anthropic-compat",
+    settings: anthropicCompatSettings,
+    shellFirst: true,
+  },
 ];
 for (const scenario of scenarios) {
   test(
-    `live packaged Pi CLI ${scenario.provider}/${scenario.model} ${scenario.compat ? `with ${scenario.compat}` : "without a compat extension"} instructs, compacts, and resumes`,
+    `live packaged Pi CLI ${scenario.provider}/${scenario.model} ${scenario.compat ? `with ${scenario.compat}` : "without a compat extension"}${scenario.shellFirst ? " after a shell command" : ""} instructs, compacts, and resumes`,
     { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 900_000 },
     async (t) => {
       const { loaded, options, settingsFile, work, errors } = await prepareLive(t, scenario);
@@ -368,6 +378,10 @@ for (const scenario of scenarios) {
 
       // Measure the context after one turn, then set thresholds relative to it.
       await client.start();
+      if (scenario.shellFirst) {
+        const shell = await client.bash("printf 'Synthetic shell output: project Lantern\\n'");
+        assert.equal(shell.exitCode, 0);
+      }
       await turn("Use the read tool to read facts.txt. Remember the facts and reply with OK.");
       const baseline = (await client.getSessionStats()).contextUsage?.tokens;
       assert.ok(typeof baseline === "number" && baseline > 0);
@@ -510,11 +524,40 @@ for (const scenario of scenarios) {
       assert.ok(compactionEntry?.type === "compaction");
       // A compat extension supplies the native compaction. Without one, Pi summarizes.
       assert.equal(Boolean(compactionEntry.fromHook), scenario.compat !== undefined);
+      let cacheReport = "";
+      if (scenario.provider === "anthropic") {
+        // Adding `compact` keeps everything the request before cached. The native summary request
+        // leaves out the compaction instruction, so it reads the prefix cached before it.
+        const usage = (request: { entry: number }) => {
+          const response = entries
+            .slice(0, request.entry)
+            .findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
+          assert.ok(response?.type === "message" && response.message.role === "assistant");
+          return response.message.usage;
+        };
+        const beforeUsage = usage(before);
+        const cached = beforeUsage.cacheRead + beforeUsage.cacheWrite;
+        const added = usage(first).cacheRead;
+        assert.ok(
+          added >= cached,
+          `The request that added compact read ${added} of ${cached} cached tokens.`,
+        );
+        cacheReport = ` The request that added compact read ${added} of ${cached} cached tokens`;
+        if (scenario.compat === "pi-anthropic-compat") {
+          const summary = compactionEntry.usage?.cacheRead ?? 0;
+          assert.ok(
+            summary >= cached,
+            `The native summary request read ${summary} of ${cached} cached tokens.`,
+          );
+          cacheReport += `, and the summary request read ${summary}`;
+        }
+        cacheReport += ".";
+      }
 
       await turn("Reply with only the port number from the project facts.");
       assert.match(await lastAssistantText(), /4317/);
       t.diagnostic(
-        `Pi ${piVersion} with ${scenario.compat ?? "no compat extension"}: the compaction instruction reached ${scenario.provider}/${scenario.model} as a mid-conversation ${scenario.role} item beside an unchanged ${found[0]?.systemLength ?? 0}-character top-level system prompt; compact was declared only with the compaction instruction, ${topLevelChange ? "in the top-level tools" : "inside the conversation with unchanged top-level tools"}, and withdrawn after compaction; the model compacted and resumed.`,
+        `Pi ${piVersion} with ${scenario.compat ?? "no compat extension"}: the compaction instruction reached ${scenario.provider}/${scenario.model} as a mid-conversation ${scenario.role} item beside an unchanged ${found[0]?.systemLength ?? 0}-character top-level system prompt; compact was declared only with the compaction instruction, ${topLevelChange ? "in the top-level tools" : "inside the conversation with unchanged top-level tools"}, and withdrawn after compaction; the model compacted and resumed.${cacheReport}`,
       );
     },
   );

@@ -15,7 +15,8 @@
 - Test instructions at the provider boundary. Live tests must cover Anthropic and Codex through
   the packaged Pi CLI with the system prompt patcher and the provider's compat extension.
   They also cover a real pi-anthropic-compat cancellation whose published reason reaches the
-  notice.
+  notice. Anthropic scenarios assert that the request adding `compact` and the native summary
+  request read the prompt cache, including a session that starts with a `!` shell command.
 - Keep the continuation message separate from summarizer instructions. Never replay a cancelled
   compaction request.
 - Run `mise run check` before committing meaningful code changes. It runs `hk check --all --check`,
