@@ -46,7 +46,7 @@
     "@types/node": "22.20.4",
     "oxfmt": "0.70.0",
     "oxlint": "1.85.0",
-    "oxlint-tsgolint": "7.0.2003",
+    "oxlint-tsgolint": "7.0.2004",
     "pi-anthropic-compat": "0.0.17",
     "pi-openai-codex-compat": "0.0.29",
     "pi-system-prompt-patcher": "0.0.13",
