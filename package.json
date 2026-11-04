@@ -50,7 +50,7 @@
     "pi-anthropic-compat": "0.0.19",
     "pi-openai-codex-compat": "0.0.30",
     "pi-system-prompt-patcher": "0.0.14",
-    "typebox": "1.3.34",
+    "typebox": "1.4.3",
     "typescript": "7.0.2"
   },
   "peerDependencies": {
