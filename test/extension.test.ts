@@ -15,7 +15,14 @@ import {
   type FauxResponseFactory,
   type Message,
 } from "@earendil-works/pi-ai";
-import type { AgentSession, ExtensionFactory, SessionEntry } from "@earendil-works/pi-coding-agent";
+import {
+  keyHint,
+  keyText,
+  type AgentSession,
+  type EntryRenderOptions,
+  type ExtensionFactory,
+  type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager, getKeybindings, setKeybindings } from "@earendil-works/pi-tui";
 import {
   COMPACTION_CANCELLED_CHANNEL,
@@ -134,6 +141,11 @@ const EXPAND_KEY = {
 } as const;
 
 /** A theme that leaves text unstyled, so rendered lines compare as plain text. */
+/** Render options with key formatters that read the installed keybindings, as Pi injects them. */
+function renderOptions(expanded: boolean): EntryRenderOptions {
+  return { expanded, keyText, keyHint };
+}
+
 const plainTheme = {
   fg: (_color: string, text: string) => text,
   bg: (_color: string, text: string) => text,
@@ -142,7 +154,7 @@ const plainTheme = {
 
 function rendered(entry: SessionEntry | undefined, expanded: boolean): string {
   assert.ok(entry?.type === "custom");
-  const component = renderInstruction(entry, { expanded }, plainTheme);
+  const component = renderInstruction(entry, renderOptions(expanded), plainTheme);
   assert.ok(component, "The instruction entry renders.");
   return (
     component
@@ -215,7 +227,7 @@ test("RPC clients get a notice for the recorded instruction", async () => {
 
 test("the renderer skips data that is not an instruction record", () => {
   assert.equal(
-    renderInstruction({ data: { stage: "later" } }, { expanded: true }, plainTheme),
+    renderInstruction({ data: { stage: "later" } }, renderOptions(true), plainTheme),
     undefined,
   );
 });
@@ -247,7 +259,7 @@ test("preparation instructions recorded by earlier versions are skipped", async 
     assert.deepEqual(laterSystemMessages(seen[1] ?? []), []);
     assert.equal(declaresCompact(seen[1] ?? []), false);
     assert.deepEqual(activeInstructions(manager.getBranch()), []);
-    assert.equal(renderInstruction({ data: stale }, { expanded: true }, plainTheme), undefined);
+    assert.equal(renderInstruction({ data: stale }, renderOptions(true), plainTheme), undefined);
     assert.deepEqual(errors, []);
   } finally {
     await runtime.dispose();
@@ -272,7 +284,7 @@ test("the collapsed instruction shows no hint when no key expands it", (t) => {
         timestamp: 1,
       },
     },
-    { expanded: false },
+    renderOptions(false),
     plainTheme,
   );
   assert.deepEqual(

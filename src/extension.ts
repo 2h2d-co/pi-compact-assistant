@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { estimateTokens, getAgentDir, keyText } from "@earendil-works/pi-coding-agent";
+import { estimateTokens, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type {
   BeforeAgentStartEvent,
   ContextWithSystemEvent,
@@ -139,7 +139,7 @@ export function renderInstruction(
   if (!isInstructionRecord(record)) return undefined;
   const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
   const summary = `${theme.fg("customMessageLabel", theme.bold(INSTRUCTION_LABEL))} ${theme.fg("customMessageText", tokenSummary(record))}`;
-  const key = keyText("app.tools.expand");
+  const key = options.keyText("app.tools.expand");
   // Without a bound expand key there is nothing to press, so no hint is shown.
   const hint =
     options.expanded || !key
