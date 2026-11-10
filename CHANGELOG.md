@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Require Pi `>=1.5.2 <1.6.0`.
+
 ## [0.0.8] - 2026-11-10
 
 ### Changed
