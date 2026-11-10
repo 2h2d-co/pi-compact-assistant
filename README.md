@@ -17,8 +17,8 @@ system prompt, Anthropic's `system` field or Codex's `instructions` field, stays
 
 ## Requirements and loading
 
-Tested with Pi **1.5.0** and Node.js **22.23.4**. The package requires Pi `>=1.5.0 <1.6.0` and
-Node.js `>=22.19.0`. The extension refuses to load on a Pi older than 1.5.0, because Pi does not
+Tested with Pi **1.5.1** and Node.js **22.23.4**. The package requires Pi `>=1.5.1 <1.6.0` and
+Node.js `>=22.19.0`. The extension refuses to load on a Pi older than 1.5.1, because Pi does not
 enforce the peer range when it installs packages.
 
 **Pi's virtual models are not supported.** Pi's experimental virtual models, registered with
@@ -116,9 +116,9 @@ version skips such instructions in resumed sessions.
 The extension instructs only models that meet all of these conditions:
 
 - the provider is `anthropic` or `openai-codex`, the request paths the live tests cover;
-- Pi marks the model as accepting system messages mid-conversation. Pi 1.5.0 marks Claude Fable 5,
-  Fable 5.1, Opus 4.8, Opus 5, Opus 5.5, Sonnet 5.5, and Haiku 5.5, and the Codex GPT-5.6, GPT-6,
-  and GPT-6.1 models this way. For other models Pi would fold each instruction
+- Pi marks the model as accepting system messages mid-conversation. Pi 1.5.1 marks Claude Fable 5,
+  Fable 5.1, Fable 5.2, Opus 4.8, Opus 5, Opus 5.5, Sonnet 5.5, and Haiku 5.5, and the Codex
+  GPT-5.6, GPT-6, and GPT-6.1 models this way. For other models Pi would fold each instruction
   into the leading system prompt, which changes the cached prefix; and
 - for `openai-codex`, a loaded `pi-openai-codex-compat` is 0.0.23 or later. The extension reads
   its version from the loaded package. Older versions drop the instruction from Codex requests.
