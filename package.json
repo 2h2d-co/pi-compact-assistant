@@ -47,8 +47,8 @@
     "oxfmt": "0.70.0",
     "oxlint": "1.85.0",
     "oxlint-tsgolint": "7.0.2003",
-    "pi-anthropic-compat": "0.0.20",
-    "pi-openai-codex-compat": "0.0.31",
+    "pi-anthropic-compat": "0.0.22",
+    "pi-openai-codex-compat": "0.0.32",
     "pi-system-prompt-patcher": "0.0.16",
     "typebox": "1.3.34",
     "typescript": "7.0.2"
