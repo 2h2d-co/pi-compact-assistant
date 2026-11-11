@@ -17,7 +17,7 @@ system prompt, Anthropic's `system` field or Codex's `instructions` field, stays
 
 ## Requirements and loading
 
-Tested with Pi **1.5.2** and Node.js **22.23.4**. The package requires Pi `>=1.5.2 <1.6.0` and
+Tested with Pi **1.5.2** and Node.js **22.23.5**. The package requires Pi `>=1.5.2 <1.6.0` and
 Node.js `>=22.19.0`. The extension refuses to load on a Pi older than 1.5.2, because Pi does not
 enforce the peer range when it installs packages.
 
