@@ -101,9 +101,39 @@ function declaredTools(declarations: unknown, items: readonly unknown[]): string
   return [...names];
 }
 
-/** The top-level system prompt: Anthropic Messages `system`, or Codex Responses `instructions`. */
-function topLevelSystem(payload: { system?: unknown; instructions?: unknown }): string {
-  return textOf(payload.system ?? payload.instructions);
+/**
+ * The leading system prompt: Anthropic Messages `system`, the Codex Responses `instructions` that
+ * pi-openai-codex-compat passes to extensions, or the first developer message in `input` that Pi's
+ * own Codex adapter sends after its `additional_tools` items.
+ */
+function topLevelSystem(payload: {
+  system?: unknown;
+  instructions?: unknown;
+  input?: unknown;
+}): string {
+  if (payload.system !== undefined) return textOf(payload.system);
+  if (payload.instructions !== undefined) return textOf(payload.instructions);
+  if (!Array.isArray(payload.input)) return "";
+  const first: unknown = payload.input.find(
+    (item: unknown) =>
+      !(
+        typeof item === "object" &&
+        item !== null &&
+        "type" in item &&
+        item.type === "additional_tools"
+      ),
+  );
+  if (
+    typeof first !== "object" ||
+    first === null ||
+    "type" in first ||
+    !("role" in first) ||
+    first.role !== "developer" ||
+    !("content" in first)
+  ) {
+    return "";
+  }
+  return textOf(first.content);
 }
 
 /**

@@ -325,14 +325,14 @@ const scenarios = [
   },
   {
     provider: "openai-codex",
-    model: "gpt-6.1-sol",
+    model: "gpt-6.2-sol",
     role: "developer",
     compat: undefined,
     settings: undefined,
   },
   {
     provider: "openai-codex",
-    model: "gpt-6.1-sol",
+    model: "gpt-6.2-sol",
     role: "developer",
     compat: "pi-openai-codex-compat",
     settings: undefined,
