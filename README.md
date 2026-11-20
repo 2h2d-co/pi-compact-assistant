@@ -231,10 +231,11 @@ never files, processes, or permissions.
 - Without a compat extension, Pi's built-in Anthropic provider receives the instruction as a system
   message, and Pi writes the summary. Live tests pass with Claude Sonnet 5.5.
 - **`pi-openai-codex-compat`** 0.0.23 or later: Codex remote compaction handles `compact`, and the
-  instruction reaches Codex as a developer message. Live tests pass with GPT-6.2 Sol. Version 0.0.22
-  and earlier drop the instruction, because they build Codex requests only from the stored session.
+  instruction reaches Codex as a developer message. Live tests pass with GPT-6.2 Sol and GPT-6.2
+  Astra. Version 0.0.22 and earlier drop the instruction, because they build Codex requests only
+  from the stored session.
 - Without a compat extension, Pi's built-in Codex provider receives the instruction as a developer
-  message, and Pi writes the summary. Live tests pass with GPT-6.2 Sol.
+  message, and Pi writes the summary. Live tests pass with GPT-6.2 Sol and GPT-6.2 Astra.
 
 ## Development
 

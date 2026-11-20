@@ -337,6 +337,20 @@ const scenarios = [
     compat: "pi-openai-codex-compat",
     settings: undefined,
   },
+  {
+    provider: "openai-codex",
+    model: "gpt-6.2-astra",
+    role: "developer",
+    compat: undefined,
+    settings: undefined,
+  },
+  {
+    provider: "openai-codex",
+    model: "gpt-6.2-astra",
+    role: "developer",
+    compat: "pi-openai-codex-compat",
+    settings: undefined,
+  },
   // A `!` shell command before the first prompt comes ahead of Pi's prompt in the transcript.
   // pi-anthropic-compat moves the prompt first, so adding `compact` keeps the prompt cache.
   {
