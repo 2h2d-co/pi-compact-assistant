@@ -409,12 +409,16 @@ for (const scenario of scenarios) {
         const continuation = entries.findIndex(
           (entry) => entry.type === "custom_message" && entry.customType === CONTINUATION_TYPE,
         );
+        // The resumed agent may compact again after its run ends, and Pi rejects prompts until
+        // that compaction finishes.
+        const state = await client.getState();
         resumed =
           continuation >= 0 &&
           entries
             .slice(continuation + 1)
             .some((entry) => entry.type === "message" && entry.message.role === "assistant") &&
-          !(await client.getState()).isStreaming;
+          !state.isStreaming &&
+          !state.isCompacting;
         if (!resumed) await setTimeout(2000);
       }
       assert.ok(
@@ -552,6 +556,11 @@ for (const scenario of scenarios) {
           cacheReport += `, and the summary request read ${summary}`;
         }
         cacheReport += ".";
+      }
+
+      const compactions = entries.filter((entry) => entry.type === "compaction").length;
+      if (compactions > 1) {
+        t.diagnostic(`The resumed agent compacted again: ${compactions} compactions.`);
       }
 
       await turn("Reply with only the port number from the project facts.");
