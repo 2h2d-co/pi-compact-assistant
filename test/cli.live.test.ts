@@ -27,6 +27,7 @@ import { CONTINUATION_TYPE, INSTRUCTION_TYPE, NOTICE_TYPE } from "../src/extensi
 import { SETTINGS_FILE_NAME } from "../src/settings.ts";
 import { CANCEL_MODE_ENV, type CancelMode } from "./support/cancel-probe.ts";
 import { describeFailure, errorLog } from "./support/error-log.ts";
+import { NEWEST_CLAUDE_MODELS } from "./support/live-models.ts";
 import { HOLD_DIR_ENV, STARTED_FILE, TYPED_FILE } from "./support/compaction-probe.ts";
 import {
   archiveEntries,
@@ -146,6 +147,7 @@ interface Scenario {
   role: string;
   compat: string | undefined;
   settings: { file: string; value: unknown } | undefined;
+  shellFirst?: boolean;
 }
 
 /**
@@ -307,22 +309,19 @@ const anthropicCompatSettings = {
   file: "pi-anthropic-compat.json",
   value: { enabled: true, keepRecentTokens: 0 },
 };
-const scenarios = [
-  {
-    provider: "anthropic",
-    model: "claude-sonnet-5-5",
-    role: "system",
-    compat: "pi-anthropic-compat",
-    settings: anthropicCompatSettings,
-  },
-  // Pi's built-in Anthropic provider sends the instructions and summarizes with Pi's compaction.
-  {
-    provider: "anthropic",
-    model: "claude-sonnet-5-5",
-    role: "system",
-    compat: undefined,
-    settings: undefined,
-  },
+const anthropicCompatScenario = (model: string): Scenario => ({
+  provider: "anthropic",
+  model,
+  role: "system",
+  compat: "pi-anthropic-compat",
+  settings: anthropicCompatSettings,
+});
+const scenarios: Scenario[] = [
+  ...NEWEST_CLAUDE_MODELS.flatMap((model) => [
+    anthropicCompatScenario(model),
+    // Pi's built-in Anthropic provider sends the instructions and summarizes with Pi's compaction.
+    { provider: "anthropic", model, role: "system", compat: undefined, settings: undefined },
+  ]),
   {
     provider: "openai-codex",
     model: "gpt-6.2-sol",
@@ -353,14 +352,7 @@ const scenarios = [
   },
   // A `!` shell command before the first prompt comes ahead of Pi's prompt in the transcript.
   // pi-anthropic-compat moves the prompt first, so adding `compact` keeps the prompt cache.
-  {
-    provider: "anthropic",
-    model: "claude-sonnet-5-5",
-    role: "system",
-    compat: "pi-anthropic-compat",
-    settings: anthropicCompatSettings,
-    shellFirst: true,
-  },
+  ...NEWEST_CLAUDE_MODELS.map((model) => ({ ...anthropicCompatScenario(model), shellFirst: true })),
 ];
 for (const scenario of scenarios) {
   test(
@@ -600,7 +592,8 @@ async function settledEntries(
   return entries;
 }
 
-const cancellationScenario = scenarios[0];
+/** Cancellation, held input, print, and TUI cases run on each newest Claude model with its compat. */
+const claudeScenarios = NEWEST_CLAUDE_MODELS.map(anthropicCompatScenario);
 /**
  * Each way an accepted request is cancelled, through the packaged CLI and a real model that
  * reaches the compaction threshold. `abort` and `fail` use the cancel probe, which interrupts at
@@ -633,60 +626,64 @@ function hasCompactCall(entries: readonly SessionEntry[]): boolean {
   );
 }
 
-for (const cancellation of cancellations) {
-  test(
-    `live packaged Pi CLI cancels an accepted compact request on ${cancellation.mode}`,
-    { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
-    async (t) => {
-      assert.ok(cancellationScenario);
-      const prepared =
-        cancellation.mode === "native"
-          ? await prepareLive(t, {
-              ...cancellationScenario,
-              settings: {
-                file: "pi-anthropic-compat.json",
-                value: { enabled: true, keepRecentTokens: 200_000 },
-              },
-            })
-          : await prepareLive(t, cancellationScenario, { cancel: cancellation.mode });
-      const { loaded, options, errors } = prepared;
-      await armCompaction(prepared);
-      const client: RpcClient = new loaded.RpcClient(options);
-      client.onEvent(errors.rpcEvent);
-      t.after(async () => client.stop());
-      await client.start();
-      await client.promptAndWait(COMPACT_PROMPT, undefined, 240_000);
-      const entries = await settledEntries(client, (current) =>
-        current.some(
+for (const claudeScenario of claudeScenarios) {
+  for (const cancellation of cancellations) {
+    test(
+      `live packaged Pi CLI ${claudeScenario.model} cancels an accepted compact request on ${cancellation.mode}`,
+      { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
+      async (t) => {
+        const prepared =
+          cancellation.mode === "native"
+            ? await prepareLive(t, {
+                ...claudeScenario,
+                settings: {
+                  file: "pi-anthropic-compat.json",
+                  value: { enabled: true, keepRecentTokens: 200_000 },
+                },
+              })
+            : await prepareLive(t, claudeScenario, { cancel: cancellation.mode });
+        const { loaded, options, errors } = prepared;
+        await armCompaction(prepared);
+        const client: RpcClient = new loaded.RpcClient(options);
+        client.onEvent(errors.rpcEvent);
+        t.after(async () => client.stop());
+        await client.start();
+        await client.promptAndWait(COMPACT_PROMPT, undefined, 240_000);
+        const entries = await settledEntries(client, (current) =>
+          current.some(
+            (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
+          ),
+        );
+        assert.doesNotMatch(client.getStderr(), /Extension error|Failed to load extension/);
+        assert.ok(
+          hasCompactCall(entries),
+          `The model called compact. Entries: ${outline(entries)}`,
+        );
+        const notice = entries.find(
           (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
-        ),
-      );
-      assert.doesNotMatch(client.getStderr(), /Extension error|Failed to load extension/);
-      assert.ok(hasCompactCall(entries), `The model called compact. Entries: ${outline(entries)}`);
-      const notice = entries.find(
-        (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
-      );
-      assert.ok(
-        notice?.type === "custom_message",
-        `A notice was sent. Entries: ${outline(entries)}`,
-      );
-      assert.match(JSON.stringify(notice.content), cancellation.notice);
-      assert.equal(
-        entries.some(
-          (entry) => entry.type === "custom_message" && entry.customType === CONTINUATION_TYPE,
-        ),
-        false,
-        "The continuation message is withheld.",
-      );
-      assert.equal(
-        entries.some((entry) => entry.type === "compaction"),
-        false,
-      );
-      t.diagnostic(
-        `Pi ${piVersion} with ${cancellationScenario.compat ?? "no compat extension"}: ${cancellation.mode} cancelled the request with a notice.`,
-      );
-    },
-  );
+        );
+        assert.ok(
+          notice?.type === "custom_message",
+          `A notice was sent. Entries: ${outline(entries)}`,
+        );
+        assert.match(JSON.stringify(notice.content), cancellation.notice);
+        assert.equal(
+          entries.some(
+            (entry) => entry.type === "custom_message" && entry.customType === CONTINUATION_TYPE,
+          ),
+          false,
+          "The continuation message is withheld.",
+        );
+        assert.equal(
+          entries.some((entry) => entry.type === "compaction"),
+          false,
+        );
+        t.diagnostic(
+          `Pi ${piVersion} with ${claudeScenario.compat ?? "no compat extension"}: ${cancellation.mode} cancelled the request with a notice.`,
+        );
+      },
+    );
+  }
 }
 
 /**
@@ -708,88 +705,96 @@ function assistantText(entry: SessionEntry | undefined): string | undefined {
   return entry.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
 }
 
-for (const hold of holds) {
-  test(
-    `live packaged Pi CLI delivers user input sent ${hold.when} and still compacts`,
-    { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
-    async (t) => {
-      assert.ok(cancellationScenario);
-      const prepared = await prepareLive(t, cancellationScenario);
-      const { loaded, options, errors } = prepared;
-      await armCompaction(prepared);
-      const client: RpcClient = new loaded.RpcClient(options);
-      client.onEvent(errors.rpcEvent);
-      t.after(async () => client.stop());
-      await client.start();
-      let sent: Promise<unknown> | undefined;
-      let read = false;
-      client.onEvent((event) => {
-        if (event.type === "tool_execution_end" && event.toolName === "read") read = true;
-        if (sent || event.type !== hold.event) return;
-        if (event.type === "message_start" && (event.message.role !== "assistant" || !read)) return;
-        sent = hold.send === "steer" ? client.steer(HELD_INPUT) : client.followUp(HELD_INPUT);
-      });
-      await client.promptAndWait(COMPACT_PROMPT, undefined, 240_000);
-      const userIndex = (entries: readonly SessionEntry[]) =>
-        entries.findIndex(
-          (entry) =>
-            entry.type === "message" &&
-            entry.message.role === "user" &&
-            JSON.stringify(entry.message.content).includes(HELD_INPUT),
-        );
-      const continuationIndex = (entries: readonly SessionEntry[]) =>
-        entries.findIndex(
-          (entry) => entry.type === "custom_message" && entry.customType === CONTINUATION_TYPE,
-        );
-      const answeredAfter = (entries: readonly SessionEntry[], index: number) =>
-        index >= 0 &&
-        entries
-          .slice(index + 1)
-          .some(
+for (const claudeScenario of claudeScenarios) {
+  for (const hold of holds) {
+    test(
+      `live packaged Pi CLI ${claudeScenario.model} delivers user input sent ${hold.when} and still compacts`,
+      { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
+      async (t) => {
+        const prepared = await prepareLive(t, claudeScenario);
+        const { loaded, options, errors } = prepared;
+        await armCompaction(prepared);
+        const client: RpcClient = new loaded.RpcClient(options);
+        client.onEvent(errors.rpcEvent);
+        t.after(async () => client.stop());
+        await client.start();
+        let sent: Promise<unknown> | undefined;
+        let read = false;
+        client.onEvent((event) => {
+          if (event.type === "tool_execution_end" && event.toolName === "read") read = true;
+          if (sent || event.type !== hold.event) return;
+          if (event.type === "message_start" && (event.message.role !== "assistant" || !read))
+            return;
+          sent = hold.send === "steer" ? client.steer(HELD_INPUT) : client.followUp(HELD_INPUT);
+        });
+        await client.promptAndWait(COMPACT_PROMPT, undefined, 240_000);
+        const userIndex = (entries: readonly SessionEntry[]) =>
+          entries.findIndex(
             (entry) =>
               entry.type === "message" &&
-              entry.message.role === "assistant" &&
-              entry.message.stopReason === "stop",
+              entry.message.role === "user" &&
+              JSON.stringify(entry.message.content).includes(HELD_INPUT),
           );
-      const entries = await settledEntries(
-        client,
-        (current) =>
-          answeredAfter(current, userIndex(current)) &&
-          answeredAfter(current, continuationIndex(current)),
-      );
-      assert.doesNotMatch(client.getStderr(), /Extension error|Failed to load extension/);
-      assert.equal(await sent, hold.held ? "handled" : "queued");
-      assert.ok(hasCompactCall(entries), `The model called compact. Entries: ${outline(entries)}`);
-      assert.equal(
-        entries.some(
-          (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
-        ),
-        false,
-        `No cancellation notice. Entries: ${outline(entries)}`,
-      );
-      const compaction = entries.findIndex((entry) => entry.type === "compaction");
-      const continuation = continuationIndex(entries);
-      const input = userIndex(entries);
-      assert.ok(
-        compaction >= 0 && compaction < continuation,
-        `Compaction, then the continuation. Entries: ${outline(entries)}`,
-      );
-      if (hold.held) {
-        assert.ok(continuation < input, `The input follows the continuation: ${outline(entries)}`);
-      } else {
-        assert.ok(input < compaction, `The input reaches the model first: ${outline(entries)}`);
-      }
-      // The reply to the input comes before the next user or custom message.
-      const reply = entries
-        .slice(input + 1)
-        .find((entry) => entry.type === "message" && entry.message.role === "assistant");
-      const replyText = assistantText(reply) ?? "";
-      assert.match(replyText, /READY/, "The model answers the input.");
-      t.diagnostic(
-        `Pi ${piVersion} with ${cancellationScenario.compat ?? "no compat extension"}: input sent ${hold.when} was ${hold.held ? "held until after compaction" : "answered before compaction"}: ${JSON.stringify(replyText.slice(0, 80))}.`,
-      );
-    },
-  );
+        const continuationIndex = (entries: readonly SessionEntry[]) =>
+          entries.findIndex(
+            (entry) => entry.type === "custom_message" && entry.customType === CONTINUATION_TYPE,
+          );
+        const answeredAfter = (entries: readonly SessionEntry[], index: number) =>
+          index >= 0 &&
+          entries
+            .slice(index + 1)
+            .some(
+              (entry) =>
+                entry.type === "message" &&
+                entry.message.role === "assistant" &&
+                entry.message.stopReason === "stop",
+            );
+        const entries = await settledEntries(
+          client,
+          (current) =>
+            answeredAfter(current, userIndex(current)) &&
+            answeredAfter(current, continuationIndex(current)),
+        );
+        assert.doesNotMatch(client.getStderr(), /Extension error|Failed to load extension/);
+        assert.equal(await sent, hold.held ? "handled" : "queued");
+        assert.ok(
+          hasCompactCall(entries),
+          `The model called compact. Entries: ${outline(entries)}`,
+        );
+        assert.equal(
+          entries.some(
+            (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
+          ),
+          false,
+          `No cancellation notice. Entries: ${outline(entries)}`,
+        );
+        const compaction = entries.findIndex((entry) => entry.type === "compaction");
+        const continuation = continuationIndex(entries);
+        const input = userIndex(entries);
+        assert.ok(
+          compaction >= 0 && compaction < continuation,
+          `Compaction, then the continuation. Entries: ${outline(entries)}`,
+        );
+        if (hold.held) {
+          assert.ok(
+            continuation < input,
+            `The input follows the continuation: ${outline(entries)}`,
+          );
+        } else {
+          assert.ok(input < compaction, `The input reaches the model first: ${outline(entries)}`);
+        }
+        // The reply to the input comes before the next user or custom message.
+        const reply = entries
+          .slice(input + 1)
+          .find((entry) => entry.type === "message" && entry.message.role === "assistant");
+        const replyText = assistantText(reply) ?? "";
+        assert.match(replyText, /READY/, "The model answers the input.");
+        t.diagnostic(
+          `Pi ${piVersion} with ${claudeScenario.compat ?? "no compat extension"}: input sent ${hold.when} was ${hold.held ? "held until after compaction" : "answered before compaction"}: ${JSON.stringify(replyText.slice(0, 80))}.`,
+        );
+      },
+    );
+  }
 }
 
 /** The messages among session entries. */
@@ -861,55 +866,56 @@ function compactionOrder(entries: readonly SessionEntry[]) {
  * A print or JSON run ends when its prompt returns. It must still run the compaction and the
  * continuation's turn before it exits.
  */
-for (const output of ["text", "json"] as const) {
-  test(
-    `live packaged Pi CLI ${output} print run compacts and answers the continuation before it exits`,
-    { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
-    async (t) => {
-      assert.ok(cancellationScenario);
-      const prepared = await prepareLive(t, cancellationScenario);
-      const { options, sessionFile, errors } = prepared;
-      await armCompaction(prepared);
-      const run = runPrint(options, COMPACT_PROMPT, output === "json" ? ["--mode", "json"] : []);
-      const entries = await sessionEntries(sessionFile);
-      errors.printRun(run.stderr, messages(entries));
-      assert.equal(run.error, undefined, "Pi started and finished within the timeout.");
-      assert.equal(run.status, 0, `Pi exited with status ${String(run.status)}.`);
-      const { stdout } = run;
-      const order = compactionOrder(entries);
-      assert.ok(
-        order.call >= 0 &&
-          order.call < order.compaction &&
-          order.compaction < order.continuation &&
-          order.continuation < order.reply,
-        `Compact call, compaction, continuation, then its reply. Entries: ${outline(entries)}`,
-      );
-      assert.equal(
-        entries.some(
-          (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
-        ),
-        false,
-        `No cancellation notice. Entries: ${outline(entries)}`,
-      );
-      const reply = assistantText(entries[order.reply]) ?? "";
-      assert.match(reply, /RESUMED/);
-      if (output === "text") {
-        // Text mode prints the last assistant message, so the run ended after the reply.
-        assert.equal(stdout.trim(), reply.trim());
-      } else {
-        const events = eventTypes(stdout);
-        const compactionEnd = events.indexOf("compaction_end");
-        const lastEnd = events.lastIndexOf("agent_end");
+for (const claudeScenario of claudeScenarios) {
+  for (const output of ["text", "json"] as const) {
+    test(
+      `live packaged Pi CLI ${claudeScenario.model} ${output} print run compacts and answers the continuation before it exits`,
+      { skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1", timeout: 600_000 },
+      async (t) => {
+        const prepared = await prepareLive(t, claudeScenario);
+        const { options, sessionFile, errors } = prepared;
+        await armCompaction(prepared);
+        const run = runPrint(options, COMPACT_PROMPT, output === "json" ? ["--mode", "json"] : []);
+        const entries = await sessionEntries(sessionFile);
+        errors.printRun(run.stderr, messages(entries));
+        assert.equal(run.error, undefined, "Pi started and finished within the timeout.");
+        assert.equal(run.status, 0, `Pi exited with status ${String(run.status)}.`);
+        const { stdout } = run;
+        const order = compactionOrder(entries);
         assert.ok(
-          compactionEnd >= 0 && compactionEnd < lastEnd,
-          `JSON events show compaction, then the continuation's run: ${events.join(",")}`,
+          order.call >= 0 &&
+            order.call < order.compaction &&
+            order.compaction < order.continuation &&
+            order.continuation < order.reply,
+          `Compact call, compaction, continuation, then its reply. Entries: ${outline(entries)}`,
         );
-      }
-      t.diagnostic(
-        `Pi ${piVersion} ${output} print run: compacted and answered the continuation (${JSON.stringify(reply.slice(0, 40))}) before exiting.`,
-      );
-    },
-  );
+        assert.equal(
+          entries.some(
+            (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
+          ),
+          false,
+          `No cancellation notice. Entries: ${outline(entries)}`,
+        );
+        const reply = assistantText(entries[order.reply]) ?? "";
+        assert.match(reply, /RESUMED/);
+        if (output === "text") {
+          // Text mode prints the last assistant message, so the run ended after the reply.
+          assert.equal(stdout.trim(), reply.trim());
+        } else {
+          const events = eventTypes(stdout);
+          const compactionEnd = events.indexOf("compaction_end");
+          const lastEnd = events.lastIndexOf("agent_end");
+          assert.ok(
+            compactionEnd >= 0 && compactionEnd < lastEnd,
+            `JSON events show compaction, then the continuation's run: ${events.join(",")}`,
+          );
+        }
+        t.diagnostic(
+          `Pi ${piVersion} ${output} print run: compacted and answered the continuation (${JSON.stringify(reply.slice(0, 40))}) before exiting.`,
+        );
+      },
+    );
+  }
 }
 
 function shellQuote(value: string): string {
@@ -993,85 +999,86 @@ function launchTui(t: TestContext, options: LiveOptions, prompt: string) {
  * status notice. Input typed during compaction waits in the editor's compaction queue, then
  * follows the continuation as its own message.
  */
-test(
-  "live packaged Pi CLI interactive session draws the instruction and sends input typed during compaction after the continuation",
-  {
-    skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1" || !tuiSupported,
-    timeout: 600_000,
-  },
-  async (t) => {
-    assert.ok(cancellationScenario);
-    const prepared = await prepareLive(t, cancellationScenario, { hold: true });
-    const { options, sessionFile, temporary, errors } = prepared;
-    await armCompaction(prepared);
-    const tui = launchTui(t, options, COMPACT_PROMPT);
-    try {
-      await tui.until("compaction to start", () => existsSync(join(temporary, STARTED_FILE)));
-      tui.type(HELD_INPUT);
-      await setTimeout(500);
-      tui.type("\r");
-      await tui.until("the TUI to queue the input", () =>
-        tui.screen().includes("Queued message for after compaction"),
-      );
-      await writeFile(join(temporary, TYPED_FILE), "");
+for (const claudeScenario of claudeScenarios) {
+  test(
+    `live packaged Pi CLI ${claudeScenario.model} interactive session draws the instruction and sends input typed during compaction after the continuation`,
+    {
+      skip: process.env["PI_COMPACT_ASSISTANT_LIVE_TEST"] !== "1" || !tuiSupported,
+      timeout: 600_000,
+    },
+    async (t) => {
+      const prepared = await prepareLive(t, claudeScenario, { hold: true });
+      const { options, sessionFile, temporary, errors } = prepared;
+      await armCompaction(prepared);
+      const tui = launchTui(t, options, COMPACT_PROMPT);
+      try {
+        await tui.until("compaction to start", () => existsSync(join(temporary, STARTED_FILE)));
+        tui.type(HELD_INPUT);
+        await setTimeout(500);
+        tui.type("\r");
+        await tui.until("the TUI to queue the input", () =>
+          tui.screen().includes("Queued message for after compaction"),
+        );
+        await writeFile(join(temporary, TYPED_FILE), "");
 
-      const heldIndex = (entries: readonly SessionEntry[]) =>
-        entries.findIndex(
-          (entry) =>
-            entry.type === "message" &&
-            entry.message.role === "user" &&
-            JSON.stringify(entry.message.content).includes(HELD_INPUT),
-        );
-      const answered = (entries: readonly SessionEntry[]) => {
+        const heldIndex = (entries: readonly SessionEntry[]) =>
+          entries.findIndex(
+            (entry) =>
+              entry.type === "message" &&
+              entry.message.role === "user" &&
+              JSON.stringify(entry.message.content).includes(HELD_INPUT),
+          );
+        const answered = (entries: readonly SessionEntry[]) => {
+          const held = heldIndex(entries);
+          return (
+            held >= 0 &&
+            entries
+              .slice(held + 1)
+              .some(
+                (entry) =>
+                  entry.type === "message" &&
+                  entry.message.role === "assistant" &&
+                  entry.message.stopReason === "stop",
+              )
+          );
+        };
+        let entries: SessionEntry[] = [];
+        await tui.until("the reply to the typed input", async () => {
+          entries = await sessionEntries(sessionFile);
+          return answered(entries);
+        });
+        assert.doesNotMatch(tui.screen(), /Extension error|Failed to load extension/);
+        const order = compactionOrder(entries);
         const held = heldIndex(entries);
-        return (
-          held >= 0 &&
-          entries
-            .slice(held + 1)
-            .some(
-              (entry) =>
-                entry.type === "message" &&
-                entry.message.role === "assistant" &&
-                entry.message.stopReason === "stop",
-            )
+        assert.ok(
+          order.call >= 0 && order.call < order.compaction && order.compaction < order.continuation,
+          `Compact call, compaction, then the continuation. Entries: ${outline(entries)}`,
         );
-      };
-      let entries: SessionEntry[] = [];
-      await tui.until("the reply to the typed input", async () => {
-        entries = await sessionEntries(sessionFile);
-        return answered(entries);
-      });
-      assert.doesNotMatch(tui.screen(), /Extension error|Failed to load extension/);
-      const order = compactionOrder(entries);
-      const held = heldIndex(entries);
-      assert.ok(
-        order.call >= 0 && order.call < order.compaction && order.compaction < order.continuation,
-        `Compact call, compaction, then the continuation. Entries: ${outline(entries)}`,
-      );
-      assert.ok(
-        order.continuation < held,
-        `The typed input follows the continuation. Entries: ${outline(entries)}`,
-      );
-      assert.equal(
-        entries.some(
-          (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
-        ),
-        false,
-        `No cancellation notice. Entries: ${outline(entries)}`,
-      );
-      const reply = entries
-        .slice(held + 1)
-        .find((entry) => entry.type === "message" && entry.message.role === "assistant");
-      const replyText = assistantText(reply) ?? "";
-      assert.match(replyText, /READY/, "The model answers the typed input.");
-      assert.match(tui.screen(), /\[Compaction required\] Added at [\d,]+ tokens/);
-      assert.doesNotMatch(tui.screen(), /Compaction instruction added at|renderer failed/);
-      t.diagnostic(
-        `Pi ${piVersion} interactive TUI: the instruction appeared in the transcript as a box, and input typed during compaction followed the continuation: ${JSON.stringify(replyText.slice(0, 80))}.`,
-      );
-    } finally {
-      // The TUI shows notices only on screen, so report extension error lines and failed responses.
-      errors.printRun(tui.trimmedScreen(), messages(await sessionEntries(sessionFile)));
-    }
-  },
-);
+        assert.ok(
+          order.continuation < held,
+          `The typed input follows the continuation. Entries: ${outline(entries)}`,
+        );
+        assert.equal(
+          entries.some(
+            (entry) => entry.type === "custom_message" && entry.customType === NOTICE_TYPE,
+          ),
+          false,
+          `No cancellation notice. Entries: ${outline(entries)}`,
+        );
+        const reply = entries
+          .slice(held + 1)
+          .find((entry) => entry.type === "message" && entry.message.role === "assistant");
+        const replyText = assistantText(reply) ?? "";
+        assert.match(replyText, /READY/, "The model answers the typed input.");
+        assert.match(tui.screen(), /\[Compaction required\] Added at [\d,]+ tokens/);
+        assert.doesNotMatch(tui.screen(), /Compaction instruction added at|renderer failed/);
+        t.diagnostic(
+          `Pi ${piVersion} interactive TUI: the instruction appeared in the transcript as a box, and input typed during compaction followed the continuation: ${JSON.stringify(replyText.slice(0, 80))}.`,
+        );
+      } finally {
+        // The TUI shows notices only on screen, so report extension error lines and failed responses.
+        errors.printRun(tui.trimmedScreen(), messages(await sessionEntries(sessionFile)));
+      }
+    },
+  );
+}

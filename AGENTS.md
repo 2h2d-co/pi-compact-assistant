@@ -14,6 +14,8 @@
   valid.
 - Test instructions at the provider boundary. Live tests must cover Anthropic and Codex through
   the packaged Pi CLI with the system prompt patcher and the provider's compat extension.
+  Every Anthropic case runs on each newest Claude model in `test/support/live-models.ts`, and
+  every Codex scenario on each newest-generation Codex model, now GPT-6.2 Sol and Astra.
   They also cover a real pi-anthropic-compat cancellation whose published reason reaches the
   notice. Anthropic scenarios assert that the request adding `compact` and the native summary
   request read the prompt cache, including a session that starts with a `!` shell command.
